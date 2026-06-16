@@ -1,0 +1,12 @@
+# Python package requirements for recon_watch_multi.py
+#
+# No third-party Python packages are required.
+# The script uses the Python standard library only.
+#
+# Runtime requirements that must be installed outside pip:
+# - subfinder
+# - httpx
+# - naabu
+# - nuclei
+# Optional:
+# - gowitness

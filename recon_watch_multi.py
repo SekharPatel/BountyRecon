@@ -14,6 +14,10 @@ What it does:
 
 Run it from a Linux service or timer to control scheduling externally.
 
+Telegram credentials are loaded from a .secret file beside this script:
+  TELEGRAM_BOT_TOKEN=your_bot_token
+  TELEGRAM_CHAT_ID=your_chat_id
+
 Expected targets layout:
   targets/
     company_1.txt
@@ -39,6 +43,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import html
 import json
 import logging
 import os
@@ -327,6 +332,34 @@ def ensure_utf8_text(v: Any) -> str:
         return json.dumps(v, ensure_ascii=False)
     except Exception:
         return str(v)
+
+
+def read_secret_file(path: Path) -> dict[str, str]:
+    """Read simple KEY=VALUE entries without modifying the process environment."""
+    if not path.exists():
+        return {}
+
+    secrets: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8", errors="ignore").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            raise ValueError(f"Invalid secret entry at {path}:{line_number}")
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        secrets[key] = value
+
+    return secrets
 
 
 def normalize_url(host: str, url: Optional[str]) -> str:
@@ -1002,21 +1035,255 @@ def build_host_report(conn: sqlite3.Connection, program_name: str, host: str, pr
     return "\n".join(lines)
 
 
-def notify_new_hosts(
-    conn: sqlite3.Connection,
+TELEGRAM_MESSAGE_LIMIT = 3900
+SUMMARY_HOST_LIMIT = 20
+SUMMARY_LIST_LIMIT = 20
+
+
+def clean_text(value: Any, max_chars: int = 160) -> str:
+    text = ensure_utf8_text(value).replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    if not text:
+        return "N/A"
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def html_text(value: Any, max_chars: int = 160) -> str:
+    return html.escape(clean_text(value, max_chars), quote=False)
+
+
+def html_code(value: Any, max_chars: int = 160) -> str:
+    return f"<code>{html_text(value, max_chars)}</code>"
+
+
+def split_telegram_message(message: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in message.splitlines():
+        line_len = len(line) + 1
+        if line_len > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(line), limit):
+                chunks.append(line[start : start + limit])
+            continue
+
+        if current and current_len + line_len > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [message]
+
+
+def format_code_list(items: list[str], limit: int = SUMMARY_LIST_LIMIT) -> str:
+    shown = [html_code(item, 100) for item in items[:limit]]
+    if len(items) > limit:
+        shown.append(f"+{len(items) - limit} more")
+    return ", ".join(shown) if shown else "none"
+
+
+def format_tech(tech: Any) -> str:
+    if isinstance(tech, str):
+        try:
+            values = as_list(json.loads(tech))
+        except Exception:
+            values = [tech]
+    else:
+        values = as_list(tech)
+
+    cleaned = [clean_text(item, 40) for item in values if clean_text(item, 40) != "N/A"]
+    if not cleaned:
+        return "none"
+    return html_text(", ".join(cleaned[:6]), 180)
+
+
+def format_port_entry(port: dict[str, Any]) -> str:
+    port_value = port.get("port") or "?"
+    protocol = clean_text(port.get("protocol"), 20)
+    service = clean_text(port.get("service"), 40)
+    version = clean_text(port.get("version"), 80)
+
+    endpoint = str(port_value)
+    if protocol != "N/A":
+        endpoint = f"{endpoint}/{protocol}"
+
+    details = " ".join(part for part in (service, version) if part != "N/A")
+    return clean_text(f"{endpoint} {details}".strip(), 120)
+
+
+def format_ports(ports: list[dict[str, Any]], limit: int = 6) -> str:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for port in ports:
+        entry = format_port_entry(port)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+
+    shown = [html_code(entry, 120) for entry in entries[:limit]]
+    if len(entries) > limit:
+        shown.append(f"+{len(entries) - limit} more")
+    return ", ".join(shown) if shown else "none"
+
+
+def severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        severity = clean_text(finding.get("severity") or "unknown", 30).lower()
+        counts[severity] = counts.get(severity, 0) + 1
+    return counts
+
+
+def format_severity_counts(findings: list[dict[str, Any]]) -> str:
+    counts = severity_counts(findings)
+    if not counts:
+        return "none"
+
+    ordered = ["critical", "high", "medium", "low", "info", "unknown"]
+    parts = [f"{sev}: {counts.pop(sev)}" for sev in ordered if sev in counts]
+    parts.extend(f"{sev}: {count}" for sev, count in sorted(counts.items()))
+    return ", ".join(parts)
+
+
+def group_by_subdomain(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        host = str(item.get("subdomain") or "").strip()
+        if not host:
+            continue
+        grouped.setdefault(host, []).append(item)
+    return grouped
+
+
+def build_program_summary_report(
+    program_name: str,
+    roots: list[str],
+    job_dir: Path,
+    discovered_count: int,
+    new_hosts: list[str],
+    seen_hosts: list[str],
+    httpx_results: list[dict[str, Any]],
+    live_hosts: list[str],
+    port_results: list[dict[str, Any]],
+    nuclei_findings: list[dict[str, Any]],
+) -> str:
+    httpx_by_host = {str(r.get("subdomain") or ""): r for r in httpx_results}
+    ports_by_host = group_by_subdomain(port_results)
+    nuclei_by_host = group_by_subdomain(nuclei_findings)
+    live_set = set(live_hosts)
+    non_live_new_hosts = [host for host in new_hosts if host not in live_set]
+
+    lines = [
+        "<b>Recon Summary</b>",
+        f"Program: {html_code(program_name)}",
+        f"Time: {html_text(utc_now(), 40)}",
+        f"Scope roots: {len(roots)} ({format_code_list(roots, 8)})",
+        f"Artifacts: {html_code(str(job_dir), 240)}",
+        "",
+        "<b>Tool summary</b>",
+        f"- Subfinder: {discovered_count} discovered, {len(new_hosts)} new, {len(seen_hosts)} already known",
+        f"- HTTPX: {len(httpx_results)} checked, {len(live_hosts)} live",
+        f"- Naabu: {len(port_results)} port/service result(s)",
+        f"- Nuclei: {len(nuclei_findings)} finding(s) ({format_severity_counts(nuclei_findings)})",
+        "",
+        "<b>New subdomains</b>",
+        format_code_list(new_hosts),
+    ]
+
+    if live_hosts:
+        lines.extend(["", "<b>Live host details</b>"])
+        for host in live_hosts[:SUMMARY_HOST_LIMIT]:
+            httpx_result = httpx_by_host.get(host, {})
+            title = httpx_result.get("title") or "N/A"
+            status = httpx_result.get("status_code") or "N/A"
+            url = httpx_result.get("url") or f"https://{host}"
+            tech = format_tech(httpx_result.get("tech"))
+            host_ports = ports_by_host.get(host, [])
+            host_findings = nuclei_by_host.get(host, [])
+
+            lines.extend(
+                [
+                    f"- {html_code(host)}",
+                    f"  URL: {html_text(url, 220)}",
+                    f"  HTTP: {html_text(status, 20)} - {html_text(title, 140)}",
+                    f"  Tech: {tech}",
+                    f"  Ports: {format_ports(host_ports)}",
+                    f"  Nuclei: {format_severity_counts(host_findings)}",
+                ]
+            )
+
+        if len(live_hosts) > SUMMARY_HOST_LIMIT:
+            lines.append(f"- +{len(live_hosts) - SUMMARY_HOST_LIMIT} more live host(s)")
+    else:
+        lines.extend(["", "<b>Live host details</b>", "No live hosts found among new subdomains."])
+
+    if non_live_new_hosts:
+        lines.extend(
+            [
+                "",
+                f"<b>New non-live subdomains</b> ({len(non_live_new_hosts)})",
+                format_code_list(non_live_new_hosts),
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def send_telegram_report(bot_token: str, chat_id: str, report: str) -> None:
+    chunks = split_telegram_message(report)
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        if total > 1:
+            chunk = f"<b>Recon Summary part {index}/{total}</b>\n{chunk}"
+        send_telegram(bot_token, chat_id, chunk)
+
+
+def notify_program_summary(
     bot_token: str,
     chat_id: str,
     program_name: str,
-    program_id: int,
-    hosts: list[str],
+    roots: list[str],
+    job_dir: Path,
+    discovered_count: int,
+    new_hosts: list[str],
+    seen_hosts: list[str],
+    httpx_results: list[dict[str, Any]],
+    live_hosts: list[str],
+    port_results: list[dict[str, Any]],
+    nuclei_findings: list[dict[str, Any]],
 ) -> None:
-    for host in hosts:
-        msg = build_host_report(conn, program_name, host, program_id)
-        if msg:
-            try:
-                send_telegram(bot_token, chat_id, msg)
-            except Exception as exc:
-                logging.exception("Telegram send failed for %s/%s: %s", program_name, host, exc)
+    if not bot_token or not chat_id:
+        return
+
+    report = build_program_summary_report(
+        program_name=program_name,
+        roots=roots,
+        job_dir=job_dir,
+        discovered_count=discovered_count,
+        new_hosts=new_hosts,
+        seen_hosts=seen_hosts,
+        httpx_results=httpx_results,
+        live_hosts=live_hosts,
+        port_results=port_results,
+        nuclei_findings=nuclei_findings,
+    )
+    try:
+        send_telegram_report(bot_token, chat_id, report)
+    except Exception as exc:
+        logging.exception("Telegram summary send failed for %s: %s", program_name, exc)
 
 
 # -----------------------------
@@ -1064,6 +1331,20 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                 (utc_now(), run_id),
             )
             conn.commit()
+            notify_program_summary(
+                cfg.telegram_bot_token,
+                cfg.telegram_chat_id,
+                program_name,
+                roots,
+                job_dir,
+                len(discovered),
+                new_hosts,
+                seen_hosts,
+                [],
+                [],
+                [],
+                [],
+            )
             return
 
         (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
@@ -1073,6 +1354,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         logging.info("[%s] httpx results=%d live=%d", program_name, len(httpx_results), len(live_hosts))
 
         live_urls = [r["url"] for r in httpx_results if r.get("alive") and r.get("url")]
+        port_results: list[dict[str, Any]] = []
         if live_hosts:
             port_results = run_naabu(cfg, live_hosts, job_dir)
             store_ports(conn, program_id, port_results)
@@ -1102,13 +1384,19 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         )
         conn.commit()
 
-        notify_new_hosts(
-            conn,
+        notify_program_summary(
             cfg.telegram_bot_token,
             cfg.telegram_chat_id,
             program_name,
-            program_id,
+            roots,
+            job_dir,
+            len(discovered),
             new_hosts,
+            seen_hosts,
+            httpx_results,
+            live_hosts,
+            port_results,
+            nuclei_findings,
         )
 
     except Exception:
@@ -1127,8 +1415,11 @@ def parse_args() -> Config:
     parser.add_argument("--db", default="recon.db", help="SQLite database path.")
     parser.add_argument("--workdir", default="work", help="Artifact directory.")
     parser.add_argument("--log-file", default="logs/recon_watch.log", help="Log file path.")
-    parser.add_argument("--telegram-bot-token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-    parser.add_argument("--telegram-chat-id", default=os.environ.get("TELEGRAM_CHAT_ID", ""))
+    parser.add_argument(
+        "--secret-file",
+        default=os.environ.get("RECON_SECRET_FILE", str(Path(__file__).resolve().parent / ".secret")),
+        help="Path to the KEY=VALUE secrets file (default: .secret beside the script).",
+    )
     parser.add_argument("--subfinder-bin", default=os.environ.get("SUBFINDER_BIN", "subfinder"))
     parser.add_argument("--httpx-bin", default=os.environ.get("HTTPX_BIN", "httpx"))
     parser.add_argument("--naabu-bin", default=os.environ.get("NAABU_BIN", "naabu"))
@@ -1137,13 +1428,18 @@ def parse_args() -> Config:
     parser.add_argument("--nuclei-severities", default=os.environ.get("NUCLEI_SEVERITIES", "medium,high,critical"))
     args = parser.parse_args()
 
+    secret_file = Path(args.secret_file).expanduser()
+    secrets = read_secret_file(secret_file)
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", secrets.get("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", secrets.get("TELEGRAM_CHAT_ID", ""))
+
     return Config(
         targets_dir=Path(args.targets_dir).expanduser(),
         db_path=Path(args.db).expanduser(),
         workdir=Path(args.workdir).expanduser(),
         log_file=Path(args.log_file).expanduser(),
-        telegram_bot_token=args.telegram_bot_token,
-        telegram_chat_id=args.telegram_chat_id,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
         subfinder_bin=args.subfinder_bin,
         httpx_bin=args.httpx_bin,
         naabu_bin=args.naabu_bin,
