@@ -75,10 +75,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import argparse
 from concurrent.futures import ThreadPoolExecutor
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -90,12 +88,27 @@ from typing import Any, Optional
 
 @dataclass
 class Config:
-    targets_dir: Path
-    db_path: Path
-    workdir: Path
-    log_file: Path
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
+    root_dir: Path
+    
+    @property
+    def targets_dir(self) -> Path:
+        return self.root_dir / "targets"
+        
+    @property
+    def db_path(self) -> Path:
+        return self.root_dir / "recon.db"
+        
+    @property
+    def workdir(self) -> Path:
+        return self.root_dir / "work"
+        
+    @property
+    def log_file(self) -> Path:
+        return self.root_dir / "logs" / "recon_watch.log"
+        
+    notify_bin: str = "notify"
+    notify_id: str = ""
+    notify_step_by_step: bool = False
     subfinder_bin: str = "subfinder"
     httpx_bin: str = "httpx"
     naabu_bin: str = "naabu"
@@ -118,7 +131,6 @@ class Config:
 # -----------------------------
 
 def setup_logging(log_file: Path) -> None:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -408,33 +420,26 @@ def host_from_url(url: str) -> str:
 # Telegram
 # -----------------------------
 
-def send_telegram(bot_token: str, chat_id: str, message: str) -> None:
-    if not bot_token or not chat_id:
+def send_notify(cfg: Config, message: str) -> None:
+    """Send a notification using ProjectDiscovery's notify tool via stdin."""
+    if not message.strip():
         return
-    endpoint = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(endpoint, data=payload, method="POST")
+
+    cmd = [cfg.notify_bin, "-silent", "-bulk"]
+    if cfg.notify_id:
+        cmd.extend(["-id", cfg.notify_id])
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            _ = resp.read()
-    except urllib.error.URLError as exc:
-        if isinstance(exc, urllib.error.HTTPError):
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", errors="ignore")[:500]
-            except Exception:
-                pass
-            logging.error("Telegram API error %d: %s", exc.code, body)
-        else:
-            logging.error("Telegram network error: %s", getattr(exc, 'reason', str(exc)))
-        raise
+        subprocess.run(
+            cmd,
+            input=message,
+            text=True,
+            timeout=60,
+            check=False,
+            capture_output=True
+        )
+    except Exception as exc:
+        logging.error("Notify tool error: %s", exc)
 
 
 # -----------------------------
@@ -1132,45 +1137,16 @@ def clean_text(value: Any, max_chars: int = 160) -> str:
     return text
 
 
-def html_text(value: Any, max_chars: int = 160) -> str:
-    return html.escape(clean_text(value, max_chars), quote=False)
+def md_text(value: Any, max_chars: int = 160) -> str:
+    return clean_text(value, max_chars)
 
 
-def html_code(value: Any, max_chars: int = 160) -> str:
-    return f"<code>{html_text(value, max_chars)}</code>"
-
-
-def split_telegram_message(message: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for line in message.splitlines():
-        line_len = len(line) + 1
-        if line_len > limit:
-            if current:
-                chunks.append("\n".join(current))
-                current = []
-                current_len = 0
-            for start in range(0, len(line), limit):
-                chunks.append(line[start : start + limit])
-            continue
-
-        if current and current_len + line_len > limit:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = line_len
-        else:
-            current.append(line)
-            current_len += line_len
-
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or [message]
+def md_code(value: Any, max_chars: int = 160) -> str:
+    return f"`{md_text(value, max_chars)}`"
 
 
 def format_code_list(items: list[str], limit: int = SUMMARY_LIST_LIMIT) -> str:
-    shown = [html_code(item, 100) for item in items[:limit]]
+    shown = [md_code(item, 100) for item in items[:limit]]
     if len(items) > limit:
         shown.append(f"+{len(items) - limit} more")
     return ", ".join(shown) if shown else "none"
@@ -1188,7 +1164,7 @@ def format_tech(tech: Any) -> str:
     cleaned = [clean_text(item, 40) for item in values if clean_text(item, 40) != "N/A"]
     if not cleaned:
         return "none"
-    return html_text(", ".join(cleaned[:6]), 180)
+    return md_text(", ".join(cleaned[:6]), 180)
 
 
 def format_port_entry(port: dict[str, Any]) -> str:
@@ -1215,7 +1191,7 @@ def format_ports(ports: list[dict[str, Any]], limit: int = 6) -> str:
         seen.add(entry)
         entries.append(entry)
 
-    shown = [html_code(entry, 120) for entry in entries[:limit]]
+    shown = [md_code(entry, 120) for entry in entries[:limit]]
     if len(entries) > limit:
         shown.append(f"+{len(entries) - limit} more")
     return ", ".join(shown) if shown else "none"
@@ -1270,25 +1246,25 @@ def build_program_summary_report(
     non_live_new_hosts = [host for host in new_hosts if host not in live_set]
 
     lines = [
-        "<b>Recon Summary</b>",
-        f"Program: {html_code(program_name)}",
-        f"Time: {html_text(utc_now(), 40)}",
+        "**Recon Summary**",
+        f"Program: {md_code(program_name)}",
+        f"Time: {md_text(utc_now(), 40)}",
         f"Scope roots: {len(roots)} ({format_code_list(roots, 8)})",
-        f"Artifacts: {html_code(str(job_dir), 240)}",
+        f"Artifacts: {md_code(str(job_dir), 240)}",
         "",
-        "<b>Tool summary</b>",
+        "**Tool summary**",
         f"- Subfinder: {discovered_count} discovered, {len(new_hosts)} new, {len(seen_hosts)} already known",
         f"- HTTPX: {len(httpx_results)} checked, {len(live_hosts)} live",
         f"- Naabu: {len(port_results)} port/service result(s)",
         f"- Katana: {katana_urls_count} crawled URL(s)",
         f"- Nuclei: {len(nuclei_findings)} finding(s) ({format_severity_counts(nuclei_findings)})",
         "",
-        "<b>New subdomains</b>",
+        "**New subdomains**",
         format_code_list(new_hosts),
     ]
 
     if live_hosts:
-        lines.extend(["", "<b>Live host details</b>"])
+        lines.extend(["", "**Live host details**"])
         for host in live_hosts[:SUMMARY_HOST_LIMIT]:
             httpx_result = httpx_by_host.get(host, {})
             title = httpx_result.get("title") or "N/A"
@@ -1300,9 +1276,9 @@ def build_program_summary_report(
 
             lines.extend(
                 [
-                    f"- {html_code(host)}",
-                    f"  URL: {html_text(url, 220)}",
-                    f"  HTTP: {html_text(status, 20)} - {html_text(title, 140)}",
+                    f"- {md_code(host)}",
+                    f"  URL: {md_text(url, 220)}",
+                    f"  HTTP: {md_text(status, 20)} - {md_text(title, 140)}",
                     f"  Tech: {tech}",
                     f"  Ports: {format_ports(host_ports)}",
                     f"  Nuclei: {format_severity_counts(host_findings)}",
@@ -1312,13 +1288,13 @@ def build_program_summary_report(
         if len(live_hosts) > SUMMARY_HOST_LIMIT:
             lines.append(f"- +{len(live_hosts) - SUMMARY_HOST_LIMIT} more live host(s)")
     else:
-        lines.extend(["", "<b>Live host details</b>", "No live hosts found among new subdomains."])
+        lines.extend(["", "**Live host details**", "No live hosts found among new subdomains."])
 
     if non_live_new_hosts:
         lines.extend(
             [
                 "",
-                f"<b>New non-live subdomains</b> ({len(non_live_new_hosts)})",
+                f"**New non-live subdomains** ({len(non_live_new_hosts)})",
                 format_code_list(non_live_new_hosts),
             ]
         )
@@ -1326,20 +1302,8 @@ def build_program_summary_report(
     return "\n".join(lines)
 
 
-def send_telegram_report(bot_token: str, chat_id: str, report: str) -> None:
-    chunks = split_telegram_message(report)
-    total = len(chunks)
-    for index, chunk in enumerate(chunks, start=1):
-        if total > 1:
-            chunk = f"<b>Recon Summary part {index}/{total}</b>\n{chunk}"
-        send_telegram(bot_token, chat_id, chunk)
-        if total > 1 and index < total:
-            time.sleep(0.5)  # Rate-limit: Telegram allows ~30 msgs/sec
-
-
 def notify_program_summary(
-    bot_token: str,
-    chat_id: str,
+    cfg: Config,
     program_name: str,
     roots: list[str],
     job_dir: Path,
@@ -1352,7 +1316,7 @@ def notify_program_summary(
     nuclei_findings: list[dict[str, Any]],
     katana_urls_count: int = 0,
 ) -> None:
-    if not bot_token or not chat_id:
+    if not cfg.notify_bin:
         return
 
     report = build_program_summary_report(
@@ -1369,9 +1333,9 @@ def notify_program_summary(
         katana_urls_count=katana_urls_count,
     )
     try:
-        send_telegram_report(bot_token, chat_id, report)
+        send_notify(cfg, report)
     except Exception as exc:
-        logging.error("Telegram summary send failed for %s: %s", program_name, exc)
+        logging.error("Notify summary send failed for %s: %s", program_name, exc)
 
 
 # -----------------------------
@@ -1402,10 +1366,13 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
 
     try:
         discovered = run_subfinder(cfg, roots, job_dir)
-        logging.info("[%s] discovered %d hosts", program_name, len(discovered))
+        logging.info("[%s] Step 1 - subfinder completed successfully", program_name)
 
         new_hosts, seen_hosts = update_subdomains(conn, program_id, discovered)
-        logging.info("[%s] new=%d seen=%d", program_name, len(new_hosts), len(seen_hosts))
+        logging.info("[%s] Output saved successfully in file and database.", program_name)
+
+        if cfg.notify_step_by_step:
+            send_notify(cfg, f"[{program_name}] **Subfinder finished**: {len(discovered)} total, {len(new_hosts)} new subdomains.")
 
         cur.execute(
             "UPDATE runs SET discovered=?, new_subdomains=? WHERE id=?",
@@ -1420,8 +1387,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
             )
             conn.commit()
             notify_program_summary(
-                cfg.telegram_bot_token,
-                cfg.telegram_chat_id,
+                cfg,
                 program_name,
                 roots,
                 job_dir,
@@ -1439,8 +1405,13 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
 
         httpx_results, live_hosts = run_httpx(cfg, new_hosts, job_dir)
+        logging.info("[%s] Step 2 - httpx completed successfully", program_name)
+        logging.info("[%s] Saving file", program_name)
         store_httpx(conn, program_id, httpx_results, job_dir)
-        logging.info("[%s] httpx results=%d live=%d", program_name, len(httpx_results), len(live_hosts))
+        logging.info("[%s] Saved in database", program_name)
+
+        if cfg.notify_step_by_step:
+            send_notify(cfg, f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live.")
 
         live_urls = [r["url"] for r in httpx_results if r.get("alive") and r.get("url")]
 
@@ -1460,14 +1431,21 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
 
                 if naabu_future:
                     port_results = naabu_future.result()
+                    logging.info("[%s] Step 3 - naabu completed successfully", program_name)
+                    logging.info("[%s] Saving file", program_name)
                     store_ports(conn, program_id, port_results)
-                    logging.info("[%s] naabu results=%d", program_name, len(port_results))
+                    logging.info("[%s] Saved in database", program_name)
 
                 if katana_future:
                     katana_urls = katana_future.result()
+                    logging.info("[%s] Step 4 - katana completed successfully", program_name)
+                    logging.info("[%s] Saving file", program_name)
                     katana_parsed = parse_katana_results(job_dir)
                     store_katana(conn, program_id, katana_parsed)
-                    logging.info("[%s] katana crawled=%d urls", program_name, len(katana_urls))
+                    logging.info("[%s] Saved in database", program_name)
+                    
+            if cfg.notify_step_by_step:
+                send_notify(cfg, f"[{program_name}] **Naabu/Katana finished**: {len(port_results)} port findings, {len(katana_urls)} new URLs crawled.")
         else:
             logging.info("[%s] no live hosts/urls, skipping naabu and katana", program_name)
 
@@ -1503,8 +1481,13 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
 
             if all_nuclei_urls:
                 nuclei_findings = run_nuclei(cfg, all_nuclei_urls, job_dir)
+                logging.info("[%s] Step 5 - nuclei completed successfully", program_name)
+                logging.info("[%s] Saving file", program_name)
                 store_nuclei(conn, program_id, nuclei_findings)
-                logging.info("[%s] nuclei findings=%d", program_name, len(nuclei_findings))
+                logging.info("[%s] Saved in database", program_name)
+                
+                if cfg.notify_step_by_step:
+                    send_notify(cfg, f"[{program_name}] **Nuclei finished**: {len(nuclei_findings)} vulnerabilities found.")
         else:
             logging.info("[%s] no urls for nuclei, skipping", program_name)
 
@@ -1523,20 +1506,19 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         conn.commit()
 
         notify_program_summary(
-            cfg.telegram_bot_token,
-            cfg.telegram_chat_id,
-            program_name,
-            roots,
-            job_dir,
-            len(discovered),
-            new_hosts,
-            seen_hosts,
-            httpx_results,
-            live_hosts,
-            port_results,
-            nuclei_findings,
-            len(katana_urls),
-        )
+                cfg,
+                program_name,
+                roots,
+                job_dir,
+                len(discovered),
+                new_hosts,
+                seen_hosts,
+                httpx_results,
+                live_hosts,
+                port_results,
+                nuclei_findings,
+                len(katana_urls),
+            )
 
     except Exception:
         cur.execute(
@@ -1583,13 +1565,11 @@ def read_env_file(path: Path) -> dict[str, str]:
 # All required .env keys and their descriptions
 REQUIRED_ENV_KEYS = {
     # Paths & storage
-    "TARGETS_DIR":       "Directory containing target TXT files",
-    "DB_PATH":           "SQLite database file path",
-    "WORKDIR":           "Working directory for scan artifacts",
-    "LOG_FILE":          "Log file path",
-    # Secrets
-    "TELEGRAM_BOT_TOKEN": "Telegram bot token for notifications",
-    "TELEGRAM_CHAT_ID":  "Telegram chat ID for notifications",
+    "ROOT_DIR":          "Base directory for all script data (logs, targets, work, db)",
+    # Notifications
+    "NOTIFY_BIN":        "Path to notify binary (projectdiscovery)",
+    "NOTIFY_ID":         "Optional provider ID for notify (leave blank for default)",
+    "NOTIFY_STEP_BY_STEP": "Send alerts after each step (true/false)",
     # Tool binaries
     "SUBFINDER_BIN":     "Path to subfinder binary",
     "HTTPX_BIN":         "Path to httpx binary",
@@ -1641,24 +1621,24 @@ def validate_env(env: dict[str, str], env_file: Path) -> None:
                 invalid.append(f"  {key:25s} - must be a non-negative integer (current: '{env[key]}')")
 
     if missing or empty or invalid:
-        print("\n" + "=" * 65)
-        print("  .env CONFIGURATION ERROR")
-        print("=" * 65)
+        logging.error("=" * 65)
+        logging.error(".env CONFIGURATION ERROR")
+        logging.error("=" * 65)
         if missing:
-            print(f"\n  Missing keys ({len(missing)}):")
+            logging.error("Missing keys (%d):", len(missing))
             for line in missing:
-                print(line)
+                logging.error(line)
         if empty:
-            print(f"\n  Keys with placeholder/empty values ({len(empty)}):")
+            logging.error("Keys with placeholder/empty values (%d):", len(empty))
             for line in empty:
-                print(line)
+                logging.error(line)
         if invalid:
-            print(f"\n  Keys with invalid values ({len(invalid)}):")
+            logging.error("Keys with invalid values (%d):", len(invalid))
             for line in invalid:
-                print(line)
-        print(f"\n  File: {env_file}")
-        print("  Fix the .env file and restart the service.")
-        print("=" * 65 + "\n")
+                logging.error(line)
+        logging.error("File: %s", env_file)
+        logging.error("Fix the .env file and restart the service.")
+        logging.error("=" * 65)
         sys.exit(1)
 
 
@@ -1668,23 +1648,21 @@ def load_config() -> Config:
     env_file = script_dir / ".env"
 
     if not env_file.exists():
-        print("\n" + "=" * 65)
-        print("  FATAL: .env file not found!")
-        print(f"  Expected: {env_file}")
-        print("  Copy .env.example to .env and configure all values.")
-        print("=" * 65 + "\n")
+        logging.error("=" * 65)
+        logging.error("FATAL: .env file not found!")
+        logging.error("Expected: %s", env_file)
+        logging.error("Copy .env.example to .env and configure all values.")
+        logging.error("=" * 65)
         sys.exit(1)
 
     env = read_env_file(env_file)
     validate_env(env, env_file)
 
     return Config(
-        targets_dir=Path(env["TARGETS_DIR"]).expanduser(),
-        db_path=Path(env["DB_PATH"]).expanduser(),
-        workdir=Path(env["WORKDIR"]).expanduser(),
-        log_file=Path(env["LOG_FILE"]).expanduser(),
-        telegram_bot_token=env["TELEGRAM_BOT_TOKEN"],
-        telegram_chat_id=env["TELEGRAM_CHAT_ID"],
+        root_dir=Path(env["ROOT_DIR"]).expanduser(),
+        notify_bin=env["NOTIFY_BIN"],
+        notify_id=env["NOTIFY_ID"].strip(),
+        notify_step_by_step=env["NOTIFY_STEP_BY_STEP"].strip().lower() in ("true", "1", "yes"),
         subfinder_bin=env["SUBFINDER_BIN"],
         httpx_bin=env["HTTPX_BIN"],
         naabu_bin=env["NAABU_BIN"],
@@ -1703,76 +1681,7 @@ def load_config() -> Config:
     )
 
 
-# -----------------------------
-# First-run domain setup
-# -----------------------------
 
-def is_first_run(targets_dir: Path) -> bool:
-    """Check if this is a first run (no target files exist yet)."""
-    if not targets_dir.exists():
-        return True
-    txt_files = list(targets_dir.glob("*.txt"))
-    return len(txt_files) == 0
-
-
-def prompt_first_run_domain(targets_dir: Path) -> None:
-    """
-    Prompt the user to enter a domain on first run to bootstrap the workflow.
-    When running as a service (non-interactive), logs an error and exits.
-    """
-    # Detect non-interactive mode (e.g. running as a systemd service)
-    if not sys.stdin.isatty():
-        logging.error(
-            "FIRST RUN: No target files found in '%s'. "
-            "Run the script manually once to set up the first domain, "
-            "or create a target file manually (e.g. targets/example_com.txt "
-            "containing 'example.com').",
-            targets_dir,
-        )
-        sys.exit(1)
-
-    print()
-    print("=" * 60)
-    print("  FIRST RUN DETECTED - No target programs found!")
-    print("=" * 60)
-    print()
-    print("  Enter a domain (e.g. example.com) to create your first")
-    print("  target program and start the recon workflow.")
-    print()
-
-    while True:
-        domain = input("  Domain: ").strip().lower()
-        if not domain:
-            print("  [!] Domain cannot be empty. Try again.")
-            continue
-        # Basic validation: must contain at least one dot and no spaces
-        if " " in domain or "." not in domain:
-            print("  [!] Invalid domain format. Example: example.com")
-            continue
-        # Strip protocol if accidentally provided
-        for prefix in ("https://", "http://"):
-            if domain.startswith(prefix):
-                domain = domain[len(prefix):]
-        domain = domain.rstrip("/").rstrip(".")
-        break
-
-    # Use domain as program name (replace dots with underscores)
-    program_name = domain.replace(".", "_")
-    targets_dir.mkdir(parents=True, exist_ok=True)
-    target_file = targets_dir / f"{program_name}.txt"
-    target_file.write_text(domain + "\n", encoding="utf-8")
-
-    print()
-    print(f"  [+] Created target: {target_file}")
-    print(f"  [+] Scope domain:   {domain}")
-    print(f"  [+] Program name:   {program_name}")
-    print()
-    print("  Starting recon workflow...")
-    print("=" * 60)
-    print()
-
-
-# -----------------------------
 # File locking (service safety)
 # -----------------------------
 
@@ -1840,24 +1749,62 @@ def run_cycle(cfg: Config) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Bug Bounty Auto Recon")
+    parser.add_argument("-d", "--domain", help="Domain to add and initialize (e.g. example.com)")
+    parser.add_argument("--setup", action="store_true", help="Initialize the directory structure and database")
+    args = parser.parse_args()
+
     cfg = load_config()
+
+    if args.setup:
+        cfg.root_dir.mkdir(parents=True, exist_ok=True)
+        cfg.targets_dir.mkdir(parents=True, exist_ok=True)
+        cfg.workdir.mkdir(parents=True, exist_ok=True)
+        cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
+        connect_db(cfg.db_path).close()
+        
+        setup_logging(cfg.log_file)
+        logging.info("Setup complete. Initialized structure in %s", cfg.root_dir)
+        return 0
+
+    # Ensure root_dir exists before proceeding to normal execution
+    if not cfg.root_dir.exists() or not cfg.targets_dir.exists() or not cfg.workdir.exists() or not cfg.db_path.exists() or not cfg.log_file.parent.exists():
+        print(f"Error: Essential directories or database not found in {cfg.root_dir}. Run with --setup first.")
+        return 1
+
     setup_logging(cfg.log_file)
 
-    # First-run: prompt user for a domain if no targets exist
-    if is_first_run(cfg.targets_dir):
-        prompt_first_run_domain(cfg.targets_dir)
+    # Bootstrap logic via CLI
+    if args.domain:
+        domain = args.domain.strip().lower()
+        if " " in domain or "." not in domain:
+            logging.error("Invalid domain format. Example: example.com")
+            return 1
+            
+        for prefix in ("https://", "http://"):
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+        domain = domain.rstrip("/").rstrip(".")
+        
+        program_name = domain.replace(".", "_")
+        
+        target_file = cfg.targets_dir / f"{program_name}.txt"
+        target_file.write_text(domain + "\n", encoding="utf-8")
+        
+        logging.info("Created target: %s", target_file)
+        logging.info("Scope domain: %s", domain)
+        logging.info("Program name: %s", program_name)
 
-    if not cfg.targets_dir.exists():
-        logging.error("Targets directory does not exist: %s", cfg.targets_dir)
+    # Check if we have targets to run
+    if not list(cfg.targets_dir.glob("*.txt")):
+        logging.error("No target files found in '%s'. Add a target via -d <domain>.", cfg.targets_dir)
         return 1
 
     # Acquire file lock to prevent concurrent instances (service safety)
-    cfg.workdir.mkdir(parents=True, exist_ok=True)
     lock_file = acquire_lock(cfg.workdir)
 
-    connect_db(cfg.db_path).close()
-
     logging.info("Config loaded from .env")
+    logging.info("Root dir: %s", cfg.root_dir)
     logging.info("Targets dir: %s", cfg.targets_dir)
     logging.info("Database: %s", cfg.db_path)
     logging.info("Workdir: %s", cfg.workdir)
