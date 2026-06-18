@@ -270,6 +270,7 @@ CREATE TABLE IF NOT EXISTS runs (
     new_subdomains INTEGER NOT NULL DEFAULT 0,
     live_subdomains INTEGER NOT NULL DEFAULT 0,
     nuclei_findings INTEGER NOT NULL DEFAULT 0,
+    katana_urls INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'running',
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
@@ -382,6 +383,16 @@ def first_value(d: dict[str, Any], keys: list[str], default: Any = None) -> Any:
         if k in d and d[k] not in (None, ""):
             return d[k]
     return default
+
+
+def _katana_endpoint(obj: dict[str, Any]) -> str:
+    """Extract the endpoint URL from a katana JSONL object."""
+    req = obj.get("request")
+    if isinstance(req, dict):
+        ep = req.get("endpoint") or req.get("url") or ""
+        if ep:
+            return str(ep).strip()
+    return str(first_value(obj, ["endpoint", "url", "input"], "")).strip()
 
 
 def as_list(v: Any) -> list[Any]:
@@ -642,10 +653,19 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
     proc = run_cmd(cmd, timeout=cfg.httpx_timeout)
 
     raw_lines: list[str] = []
+    _seen_lines: set[str] = set()
+    
+    _all_lines: list[str] = []
     if out_file.exists():
-        raw_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
     if proc.stdout.strip():
-        raw_lines.extend(proc.stdout.splitlines())
+        _all_lines.extend(proc.stdout.splitlines())
+        
+    for line in _all_lines:
+        line = line.strip()
+        if line and line not in _seen_lines:
+            _seen_lines.add(line)
+            raw_lines.append(line)
 
     results: list[dict[str, Any]] = []
     live_hosts: list[str] = []
@@ -809,10 +829,19 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
     proc = run_cmd(cmd, timeout=cfg.naabu_timeout)
 
     raw_lines: list[str] = []
+    _seen_lines: set[str] = set()
+    
+    _all_lines: list[str] = []
     if out_file.exists():
-        raw_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
     if proc.stdout.strip():
-        raw_lines.extend(proc.stdout.splitlines())
+        _all_lines.extend(proc.stdout.splitlines())
+        
+    for line in _all_lines:
+        line = line.strip()
+        if line and line not in _seen_lines:
+            _seen_lines.add(line)
+            raw_lines.append(line)
 
     results: list[dict[str, Any]] = []
     for line in raw_lines:
@@ -903,7 +932,7 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
         cfg.nuclei_bin,
         "-l", str(url_file),
         "-severity", cfg.nuclei_severities,
-        "-json",
+        "-jsonl",
         "-silent",
         "-no-color",
         "-o", str(out_file),
@@ -911,10 +940,19 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
     proc = run_cmd(cmd, timeout=cfg.nuclei_timeout)
 
     raw_lines: list[str] = []
+    _seen_lines: set[str] = set()
+    
+    _all_lines: list[str] = []
     if out_file.exists():
-        raw_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
     if proc.stdout.strip():
-        raw_lines.extend(proc.stdout.splitlines())
+        _all_lines.extend(proc.stdout.splitlines())
+        
+    for line in _all_lines:
+        line = line.strip()
+        if line and line not in _seen_lines:
+            _seen_lines.add(line)
+            raw_lines.append(line)
 
     findings: list[dict[str, Any]] = []
     for line in raw_lines:
@@ -1015,10 +1053,19 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
     proc = run_cmd(cmd, timeout=cfg.katana_timeout)
 
     raw_lines: list[str] = []
+    _seen_lines: set[str] = set()
+    
+    _all_lines: list[str] = []
     if out_file.exists():
-        raw_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
     if proc.stdout.strip():
-        raw_lines.extend(proc.stdout.splitlines())
+        _all_lines.extend(proc.stdout.splitlines())
+        
+    for line in _all_lines:
+        line = line.strip()
+        if line and line not in _seen_lines:
+            _seen_lines.add(line)
+            raw_lines.append(line)
 
     discovered_urls: list[str] = []
     seen: set[str] = set()
@@ -1036,9 +1083,7 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
                     discovered_urls.append(line)
             continue
 
-        endpoint = str(
-            first_value(obj, ["request", "endpoint", "url", "input"], "")
-        ).strip()
+        endpoint = _katana_endpoint(obj)
         if endpoint.startswith("http") and endpoint not in seen:
             seen.add(endpoint)
             discovered_urls.append(endpoint)
@@ -1062,9 +1107,7 @@ def parse_katana_results(job_dir: Path) -> list[dict[str, Any]]:
         except Exception:
             continue
 
-        endpoint = str(
-            first_value(obj, ["request", "endpoint", "url", "input"], "")
-        ).strip()
+        endpoint = _katana_endpoint(obj)
         if not endpoint:
             continue
 
@@ -1412,7 +1455,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         if cfg.notify_step_by_step:
             send_notify(cfg, f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live.")
 
-        live_urls = [r["url"] for r in httpx_results if r.get("alive") and r.get("url")]
+        live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
 
         # --- Run naabu and katana in parallel ---
         port_results: list[dict[str, Any]] = []
