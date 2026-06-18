@@ -1,4 +1,4 @@
-# Python package requirements for recon_watch_multi.py
+# Python package requirements for bugBounty_auto_recon.py
 #
 # No third-party Python packages are required.
 # The script uses the Python standard library only.
@@ -7,6 +7,5 @@
 # - subfinder
 # - httpx
 # - naabu
+# - katana
 # - nuclei
-# Optional:
-# - gowitness

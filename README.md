@@ -1,6 +1,6 @@
 # Recon Watch Multi
 
-`recon_watch_multi.py` is a program-aware reconnaissance pipeline for authorized security testing and bug bounty work.
+`bugBounty_auto_recon.py` is a program-aware reconnaissance pipeline for authorized security testing and bug bounty work.
 
 It reads scoped targets from text files, discovers subdomains, tracks state in SQLite, scans only newly discovered hosts through the follow-up tools, stores artifacts, and sends a clean Telegram summary for every program run.
 
@@ -41,7 +41,7 @@ The script does not run forever. It executes once and exits. Use a Linux service
 
 ```text
 .
-|-- recon_watch_multi.py    Main scanner script
+|-- bugBounty_auto_recon.py    Main scanner script
 |-- .secret                 Local secrets file, ignored by git
 |-- .secret.example         Example secrets file
 |-- .gitignore              Ignore rules for secrets and Python cache files
@@ -202,13 +202,13 @@ If `targets/company_a.txt` contains multiple domains, they are scanned together 
 Basic run:
 
 ```bash
-python3 recon_watch_multi.py
+python3 bugBounty_auto_recon.py
 ```
 
 Custom paths:
 
 ```bash
-python3 recon_watch_multi.py \
+python3 bugBounty_auto_recon.py \
   --targets-dir /opt/recon-watch/targets \
   --db /opt/recon-watch/recon.db \
   --workdir /opt/recon-watch/work \
@@ -219,7 +219,7 @@ python3 recon_watch_multi.py \
 Custom tool paths:
 
 ```bash
-python3 recon_watch_multi.py \
+python3 bugBounty_auto_recon.py \
   --subfinder-bin /usr/local/bin/subfinder \
   --httpx-bin /usr/local/bin/httpx \
   --naabu-bin /usr/local/bin/naabu \
@@ -230,7 +230,7 @@ python3 recon_watch_multi.py \
 Custom nuclei severities:
 
 ```bash
-python3 recon_watch_multi.py --nuclei-severities medium,high,critical
+python3 bugBounty_auto_recon.py --nuclei-severities medium,high,critical
 ```
 
 ## Linux Service Setup
@@ -252,7 +252,7 @@ User=recon
 Group=recon
 WorkingDirectory=/opt/recon-watch
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/recon/go/bin
-ExecStart=/usr/bin/python3 /opt/recon-watch/recon_watch_multi.py \
+ExecStart=/usr/bin/python3 /opt/recon-watch/bugBounty_auto_recon.py \
   --targets-dir /opt/recon-watch/targets \
   --db /opt/recon-watch/recon.db \
   --workdir /opt/recon-watch/work \
