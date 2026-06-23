@@ -19,13 +19,8 @@ Configuration:
   Copy .env.example to .env and edit it before running.
   On first run (no targets found), the script will prompt you for a domain.
 
-  .env keys:
-    TARGETS_DIR          - Directory with one TXT file per program (default: targets)
-    DB_PATH              - SQLite database path (default: recon.db)
-    WORKDIR              - Artifact / work directory (default: work)
-    LOG_FILE             - Log file path (default: logs/recon_watch.log)
-    TELEGRAM_BOT_TOKEN   - Telegram bot token for notifications
-    TELEGRAM_CHAT_ID     - Telegram chat ID for notifications
+    .env keys:
+    ROOT_DIR             - Directory for all the outputs.
     SUBFINDER_BIN        - Path to subfinder binary (default: subfinder)
     HTTPX_BIN            - Path to httpx binary (default: httpx)
     NAABU_BIN            - Path to naabu binary (default: naabu)
@@ -60,6 +55,7 @@ External tools expected in PATH:
   - naabu
   - nuclei
   - katana
+  - notify
 
 Python stdlib only.
 """
@@ -79,6 +75,7 @@ import subprocess
 import sys
 import time
 import argparse
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +118,7 @@ class Config:
     subfinder_timeout: int = 3600
     httpx_timeout: int = 1800
     naabu_timeout: int = 3600
+    naabu_nmap_cli: bool = False
     nuclei_timeout: int = 3600
     katana_timeout: int = 3600
     katana_depth: int = 3
@@ -213,10 +211,20 @@ CREATE TABLE IF NOT EXISTS httpx_results (
     status_code INTEGER,
     title TEXT,
     tech TEXT,
-    server TEXT,
-    ip TEXT,
+    webserver TEXT,
+    host_ip TEXT,
     cname TEXT,
-    raw_json TEXT NOT NULL,
+    port INTEGER,
+    scheme TEXT,
+    content_type TEXT,
+    method TEXT,
+    path TEXT,
+    time TEXT,
+    a TEXT,
+    aaaa TEXT,
+    cdn_name TEXT,
+    cdn_type TEXT,
+    resolvers TEXT,
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
@@ -227,11 +235,7 @@ CREATE TABLE IF NOT EXISTS ports (
     scanned_at TEXT NOT NULL,
     host TEXT,
     ip TEXT,
-    port INTEGER,
-    protocol TEXT,
-    service TEXT,
-    version TEXT,
-    raw_json TEXT NOT NULL,
+    open_ports TEXT NOT NULL,
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
@@ -245,7 +249,6 @@ CREATE TABLE IF NOT EXISTS nuclei_findings (
     template_id TEXT,
     name TEXT,
     matched_at TEXT,
-    raw_json TEXT NOT NULL,
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
@@ -254,11 +257,7 @@ CREATE TABLE IF NOT EXISTS katana_results (
     program_id INTEGER NOT NULL,
     subdomain TEXT NOT NULL,
     scanned_at TEXT NOT NULL,
-    url TEXT NOT NULL,
-    method TEXT,
-    status_code INTEGER,
-    source TEXT,
-    raw_json TEXT NOT NULL,
+    urls TEXT NOT NULL,
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
@@ -666,7 +665,6 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
         "-no-color",
         "-silent",
         "-o", str(out_file),
-        "-json",
     ]
     if cfg.httpx_args:
         cmd.extend(shlex.split(cfg.httpx_args))
@@ -745,12 +743,23 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
                 "status_code": int(status_code) if isinstance(status_code, (int, float, str)) and str(status_code).isdigit() else None,
                 "title": ensure_utf8_text(title),
                 "tech": json.dumps(as_list(tech), ensure_ascii=False),
-                "server": ensure_utf8_text(server),
-                "ip": ensure_utf8_text(ip),
+                "webserver": ensure_utf8_text(first_value(obj, ["webserver", "server"], "")),
+                "host_ip": ensure_utf8_text(first_value(obj, ["host_ip", "ip"], "")),
                 "cname": ensure_utf8_text(cname),
                 "screenshot_path": screenshot_path,
-                "raw_json": json.dumps(obj, ensure_ascii=False),
                 "alive": 1 if alive else 0,
+                
+                "port": first_value(obj, ["port"], None),
+                "scheme": str(first_value(obj, ["scheme"], "")).strip(),
+                "content_type": str(first_value(obj, ["content_type"], "")).strip(),
+                "method": str(first_value(obj, ["method"], "")).strip(),
+                "path": str(first_value(obj, ["path"], "")).strip(),
+                "time": str(first_value(obj, ["time"], "")).strip(),
+                "a": json.dumps(as_list(obj.get("a", [])), ensure_ascii=False),
+                "aaaa": json.dumps(as_list(obj.get("aaaa", [])), ensure_ascii=False),
+                "cdn_name": str(first_value(obj, ["cdn_name"], "")).strip(),
+                "cdn_type": str(first_value(obj, ["cdn_type"], "")).strip(),
+                "resolvers": json.dumps(as_list(obj.get("resolvers", [])), ensure_ascii=False),
             }
         )
 
@@ -776,8 +785,10 @@ def store_httpx(conn: sqlite3.Connection, program_id: int, results: list[dict[st
         cur.execute(
             """
             INSERT INTO httpx_results (
-                program_id, subdomain, scanned_at, url, status_code, title, tech, server, ip, cname, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                program_id, subdomain, scanned_at, url, status_code, title, tech,
+                webserver, host_ip, cname, port, scheme, content_type, method, path, time,
+                a, aaaa, cdn_name, cdn_type, resolvers
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 program_id,
@@ -787,10 +798,20 @@ def store_httpx(conn: sqlite3.Connection, program_id: int, results: list[dict[st
                 r["status_code"],
                 r["title"],
                 r["tech"],
-                r["server"],
-                r["ip"],
+                r["webserver"],
+                r["host_ip"],
                 r["cname"],
-                r["raw_json"],
+                int(r["port"]) if r["port"] and str(r["port"]).isdigit() else None,
+                r["scheme"],
+                r["content_type"],
+                r["method"],
+                r["path"],
+                r["time"],
+                r["a"],
+                r["aaaa"],
+                r["cdn_name"],
+                r["cdn_type"],
+                r["resolvers"],
             ),
         )
 
@@ -843,10 +864,14 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
     cmd = [
         cfg.naabu_bin,
         "-list", str(host_file),
+        "-Pn",
+        "-verify",
         "-json",
         "-silent",
         "-o", str(out_file),
     ]
+    if cfg.naabu_nmap_cli:
+        cmd.extend(["-nmap-cli", "nmap -sV"])
     if cfg.naabu_args:
         cmd.extend(shlex.split(cfg.naabu_args))
 
@@ -882,7 +907,7 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
         port = first_value(obj, ["port"], None)
         protocol = str(first_value(obj, ["protocol", "proto"], "")).strip()
         service = str(first_value(obj, ["service", "name"], "")).strip()
-        version = str(first_value(obj, ["version", "service_version", "banner", "cpe"], "")).strip()
+        version = str(first_value(obj, ["version", "product", "service_version", "banner", "cpe"], "")).strip()
 
         results.append(
             {
@@ -904,28 +929,46 @@ def store_ports(conn: sqlite3.Connection, program_id: int, port_results: list[di
     now = utc_now()
     cur = conn.cursor()
 
+    grouped = {}
     for r in port_results:
-        sub = r["subdomain"]
+        sub = r.get("subdomain", "")
         if not sub:
             continue
+        if sub not in grouped:
+            grouped[sub] = {"host": r.get("host", ""), "ip": r.get("ip", ""), "ports": []}
+        
+        grouped[sub]["ports"].append({
+            "port": r.get("port"),
+            "protocol": r.get("protocol"),
+            "service": r.get("service"),
+            "version": r.get("version"),
+        })
+
+    for sub, data in grouped.items():
+        unique_ports = {}
+        for p in data["ports"]:
+            key = (p["port"], p["protocol"])
+            if key not in unique_ports:
+                unique_ports[key] = p
+            else:
+                if not unique_ports[key].get("version") and p.get("version"):
+                    unique_ports[key] = p
+                    
+        sorted_ports = sorted(unique_ports.values(), key=lambda x: int(x["port"]) if x["port"] and str(x["port"]).isdigit() else 0)
 
         cur.execute(
             """
             INSERT INTO ports (
-                program_id, subdomain, scanned_at, host, ip, port, protocol, service, version, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                program_id, subdomain, scanned_at, host, ip, open_ports
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 program_id,
                 sub,
                 now,
-                r["host"],
-                r["ip"],
-                r["port"],
-                r["protocol"],
-                r["service"],
-                r["version"],
-                r["raw_json"],
+                data["host"],
+                data["ip"],
+                json.dumps(sorted_ports, ensure_ascii=False),
             ),
         )
 
@@ -1025,8 +1068,8 @@ def store_nuclei(conn: sqlite3.Connection, program_id: int, findings: list[dict[
         cur.execute(
             """
             INSERT OR IGNORE INTO nuclei_findings (
-                program_id, subdomain, url, scanned_at, severity, template_id, name, matched_at, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                program_id, subdomain, url, scanned_at, severity, template_id, name, matched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 program_id,
@@ -1037,7 +1080,6 @@ def store_nuclei(conn: sqlite3.Connection, program_id: int, findings: list[dict[
                 f["template_id"],
                 f["name"],
                 f["matched_at"],
-                f["raw_json"],
             ),
         )
 
@@ -1183,26 +1225,26 @@ def store_katana(conn: sqlite3.Connection, program_id: int, katana_results: list
     now = utc_now()
     cur = conn.cursor()
 
+    grouped = {}
     for r in katana_results:
         sub = r.get("subdomain", "")
         if not sub:
             continue
+        grouped.setdefault(sub, set()).add(r["url"])
 
+    for sub, urls in grouped.items():
+        sorted_urls = sorted(list(urls))
         cur.execute(
             """
             INSERT INTO katana_results (
-                program_id, subdomain, scanned_at, url, method, status_code, source, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                program_id, subdomain, scanned_at, urls
+            ) VALUES (?, ?, ?, ?)
             """,
             (
                 program_id,
                 sub,
                 now,
-                r["url"],
-                r["method"],
-                r["status_code"],
-                r["source"],
-                r["raw_json"],
+                json.dumps(sorted_urls, ensure_ascii=False),
             ),
         )
 
@@ -1460,10 +1502,24 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         logging.info("[%s] Step 1 - subfinder completed successfully", program_name)
 
         new_hosts, seen_hosts = update_subdomains(conn, program_id, discovered)
+        total_db_hosts = cur.execute("SELECT COUNT(*) FROM subdomains WHERE program_id=?", (program_id,)).fetchone()[0]
         logging.info("[%s] Output saved successfully in file and database.", program_name)
 
         if cfg.notify_step_by_step:
-            send_notify(cfg, f"[{program_name}] **Subfinder finished**: {len(discovered)} total, {len(new_hosts)} new subdomains.")
+            if len(new_hosts) > 0:
+                old_subdomains = total_db_hosts - len(new_hosts)
+                msg = (
+                    f"[{program_name}] **Subfinder finished**\n\n"
+                    f"**old subdomains**\n- {old_subdomains}\n"
+                    f"**new subdomains**\n- {len(new_hosts)}\n"
+                    f"**total now**\n- {total_db_hosts}"
+                )
+            else:
+                msg = (
+                    f"[{program_name}] **Subfinder finished**\n\n"
+                    f"**nothing new, total subdomains:**\n- {total_db_hosts}"
+                )
+            send_notify(cfg, msg)
 
         cur.execute(
             "UPDATE runs SET discovered=?, new_subdomains=? WHERE id=?",
@@ -1501,10 +1557,17 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         store_httpx(conn, program_id, httpx_results, job_dir)
         logging.info("[%s] Saved in database", program_name)
 
-        if cfg.notify_step_by_step:
-            send_notify(cfg, f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live.")
-
         live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
+
+        if cfg.notify_step_by_step:
+            lines = [f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live."]
+            if live_urls:
+                lines.append("\n**Live urls**")
+                for u in live_urls[:15]:
+                    lines.append(f"- {u}")
+                if len(live_urls) > 15:
+                    lines.append(f"*...and {len(live_urls) - 15} more*")
+            send_notify(cfg, "\n".join(lines).strip())
 
         # --- Run naabu and katana in parallel ---
         port_results: list[dict[str, Any]] = []
@@ -1530,18 +1593,40 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                         logging.info("[%s] Saved in database", program_name)
                         
                         if cfg.notify_step_by_step:
-                            host_ports: dict[str, list[str]] = {}
+                            unique_ports = {}
                             for p in port_results:
                                 host = p.get("host")
-                                if host:
-                                    host_ports.setdefault(host, []).append(str(p.get("port")))
+                                port = p.get("port")
+                                if not host or not port: continue
+                                key = (host, port)
+                                if key not in unique_ports:
+                                    unique_ports[key] = p
+                                else:
+                                    if not unique_ports[key].get("version") and p.get("version"):
+                                        unique_ports[key] = p
                             
-                            lines = [f"[{program_name}] **Naabu finished**: {len(port_results)} port findings"]
-                            for host, ports in list(host_ports.items())[:10]:
-                                lines.append(f"- {host}: {', '.join(ports)}")
-                            if len(host_ports) > 10:
-                                lines.append(f"...and {len(host_ports) - 10} more hosts")
-                            send_notify(cfg, "\n".join(lines))
+                            host_port_map: dict[str, list[dict]] = {}
+                            for p in unique_ports.values():
+                                host_port_map.setdefault(p["host"], []).append(p)
+                            
+                            lines = [f"[{program_name}] **Naabu finished**: {len(unique_ports)} unique port findings\n"]
+                            for host, ports in list(host_port_map.items())[:10]:
+                                lines.append(f"**{host}**")
+                                ports.sort(key=lambda x: int(x.get("port", 0)) if str(x.get("port", "0")).isdigit() else 0)
+                                for p in ports:
+                                    port = p.get("port")
+                                    proto = p.get("protocol") or "tcp"
+                                    svc = p.get("service") or ""
+                                    prod = p.get("version") or ""
+                                    details = ": ".join(filter(None, [svc, prod]))
+                                    svc_str = f" ({details})" if details else ""
+                                    lines.append(f"- {port}/{proto}{svc_str}")
+                                lines.append("")
+                            
+                            if len(host_port_map) > 10:
+                                lines.append(f"*...and {len(host_port_map) - 10} more hosts*")
+                            
+                            send_notify(cfg, "\n".join(lines).strip())
 
                     elif tool_name == "katana":
                         katana_urls = future.result()
@@ -1692,6 +1777,7 @@ REQUIRED_ENV_KEYS = {
     "SUBFINDER_ARGS":    "Extra subfinder args (e.g. '-all -active')",
     "HTTPX_TIMEOUT":     "HTTPX timeout in seconds",
     "NAABU_TIMEOUT":     "Naabu timeout in seconds",
+    "NAABU_NMAP_CLI":    "Enable Nmap service detection in Naabu (true/false)",
     "NUCLEI_TIMEOUT":    "Nuclei timeout in seconds",
     "KATANA_TIMEOUT":    "Katana crawling timeout in seconds",
     # Maintenance
@@ -1794,6 +1880,7 @@ def load_config() -> Config:
         subfinder_timeout=int(env["SUBFINDER_TIMEOUT"]),
         httpx_timeout=int(env["HTTPX_TIMEOUT"]),
         naabu_timeout=int(env["NAABU_TIMEOUT"]),
+        naabu_nmap_cli=env.get("NAABU_NMAP_CLI", "false").strip().lower() in ("true", "1", "yes"),
         nuclei_timeout=int(env["NUCLEI_TIMEOUT"]),
         katana_timeout=int(env["KATANA_TIMEOUT"]),
         katana_depth=int(env["KATANA_DEPTH"]),
