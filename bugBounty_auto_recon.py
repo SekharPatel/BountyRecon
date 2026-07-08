@@ -36,6 +36,14 @@ Configuration:
     KATANA_HEADLESS      - Enable katana headless browser mode (default: false)
     KATANA_FIELD_SCOPE   - Field scope for katana (-fs) (default: rdn)
     KATANA_CUSTOM_SCOPE  - Custom scope for katana (-cs) (default: empty)
+    ASNMAP_BIN           - Path to asnmap binary (default: asnmap)
+    MAPCIDR_BIN          - Path to mapcidr binary (default: mapcidr)
+    ASN_ENABLED          - Enable ASN -> CIDR -> IP recon stage (default: true)
+    ASN_TIMEOUT          - asnmap timeout in seconds (default: 900)
+    MAPCIDR_TIMEOUT      - mapcidr timeout in seconds (default: 300)
+    ASN_ALIVE_TIMEOUT    - naabu alive-check timeout for ASN IPs in seconds (default: 1800)
+    ASN_MAX_IPS          - Hard cap on expanded IPs per program, safety valve for large ASNs (default: 65536)
+    ASN_EXCLUDE_CDN      - Skip naabu -exclude-cdn filtering on ASN-derived IPs (default: true)
     MAX_JOB_RETENTION_DAYS - Auto-delete scan artifacts older than N days (default: 30, 0=disable)
     DRY_RUN              - Skip external tool execution for testing (default: false)
 
@@ -56,6 +64,8 @@ External tools expected in PATH:
   - nuclei
   - katana
   - notify
+  - asnmap   (ProjectDiscovery — org/domain -> ASN -> CIDR)
+  - mapcidr  (ProjectDiscovery — CIDR dedup/merge/expand to individual IPs)
 
 Python stdlib only.
 """
@@ -68,16 +78,22 @@ import html
 import json
 import logging
 import logging.handlers
+import re
 import shutil
 import sqlite3
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import argparse
 import urllib.parse
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
 
@@ -114,6 +130,8 @@ class Config:
     naabu_bin: str = "naabu"
     nuclei_bin: str = "nuclei"
     katana_bin: str = "katana"
+    asnmap_bin: str = "asnmap"
+    mapcidr_bin: str = "mapcidr"
     nuclei_severities: str = "medium,high,critical"
     subfinder_timeout: int = 3600
     httpx_timeout: int = 1800
@@ -126,12 +144,29 @@ class Config:
     katana_crawl_js: bool = True
     katana_field_scope: str = "rdn"
     katana_custom_scope: str = ""
+    asn_enabled: bool = True
+    asn_timeout: int = 900
+    mapcidr_timeout: int = 300
+    asn_alive_timeout: int = 1800
+    asn_max_ips: int = 65536
+    asn_exclude_cdn: bool = True
     subfinder_args: str = ""
     httpx_args: str = ""
     naabu_args: str = ""
     nuclei_args: str = ""
     katana_args: str = ""
+    asnmap_args: str = ""
     notify_args: str = ""
+    js_monitor_enabled: bool = True
+    js_monitor_threads: int = 15
+    js_monitor_timeout: int = 30
+    js_monitor_max_file_size: int = 10 * 1024 * 1024
+    js_monitor_recursion_depth: int = 3
+    js_monitor_deep: bool = False
+    js_monitor_proxy: str = ""
+    js_monitor_patterns_file: str = ""
+    js_monitor_allow_external: bool = False
+    js_notify_critical_only: bool = False
     max_job_retention_days: int = 30
     dry_run: bool = False
 
@@ -261,6 +296,31 @@ CREATE TABLE IF NOT EXISTS katana_results (
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS asn_ranges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id INTEGER NOT NULL,
+    asn TEXT NOT NULL,
+    org TEXT,
+    cidr TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    UNIQUE(program_id, cidr),
+    FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS asn_ips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id INTEGER NOT NULL,
+    ip TEXT NOT NULL,
+    cidr TEXT,
+    asn TEXT,
+    alive INTEGER NOT NULL DEFAULT 0,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_checked_at TEXT,
+    UNIQUE(program_id, ip),
+    FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     program_id INTEGER NOT NULL,
@@ -299,10 +359,12 @@ CREATE INDEX IF NOT EXISTS idx_nuclei_program ON nuclei_findings(program_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_program ON artifacts(program_id);
 CREATE INDEX IF NOT EXISTS idx_katana_program ON katana_results(program_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nuclei_unique ON nuclei_findings(program_id, subdomain, template_id, url);
+CREATE INDEX IF NOT EXISTS idx_asn_ranges_program ON asn_ranges(program_id);
+CREATE INDEX IF NOT EXISTS idx_asn_ips_program ON asn_ips(program_id);
 """
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -323,6 +385,10 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                 cur.execute("ALTER TABLE runs ADD COLUMN katana_urls INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        if current < 4:
+            # v4: asn_ranges / asn_ips tables created via CREATE TABLE IF NOT EXISTS above.
+            # Nothing to backfill; version bump only.
+            pass
         if current < CURRENT_SCHEMA_VERSION:
             cur.execute(
                 "UPDATE schema_version SET version=?, updated_at=?",
@@ -991,6 +1057,298 @@ def store_ports(conn: sqlite3.Connection, program_id: int, port_results: list[di
 
 
 # -----------------------------
+# ASN -> CIDR -> IP -> alive recon
+# -----------------------------
+
+def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, Any]]:
+    """
+    Resolve ASNs for the program's scope roots and expand to CIDR ranges.
+    asnmap accepts domains directly (-d), which internally resolves org -> ASN -> CIDR.
+    Returns a list of {asn, org, cidr} dicts, deduplicated by cidr.
+    """
+    if not roots:
+        return []
+    if cfg.dry_run:
+        logging.info("[DRY_RUN] Skipping asnmap for %d root(s)", len(roots))
+        return []
+
+    domain_file = job_dir / "asn_domains.txt"
+    domain_file.write_text("\n".join(roots) + "\n", encoding="utf-8")
+
+    out_file = job_dir / "asnmap.jsonl"
+    cmd = [
+        cfg.asnmap_bin,
+        "-l", str(domain_file),
+        "-json",
+        "-silent",
+        "-o", str(out_file),
+    ]
+    if cfg.asnmap_args:
+        cmd.extend(shlex.split(cfg.asnmap_args))
+
+    proc = run_cmd(cmd, timeout=cfg.asn_timeout)
+
+    _seen_lines: set[str] = set()
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
+
+    ranges: dict[str, dict[str, Any]] = {}
+    for line in iter_lines():
+        line = line.strip()
+        if not line or line in _seen_lines:
+            continue
+        _seen_lines.add(line)
+
+        # asnmap -json emits one JSON object per CIDR (or per ASN with a range list,
+        # depending on version). Handle both shapes defensively.
+        try:
+            obj = json.loads(line)
+        except Exception:
+            # Some asnmap versions emit plain CIDRs when -json isn't fully supported
+            # for the given query type. Treat bare CIDR-looking lines as fallback.
+            if "/" in line:
+                ranges[line] = {"asn": "", "org": "", "cidr": line}
+            continue
+
+        asn = str(first_value(obj, ["as_number", "asn"], "")).strip()
+        org = str(first_value(obj, ["as_name", "org", "as_org"], "")).strip()
+        cidr_field = first_value(obj, ["as_range", "range", "cidr", "cidrs"], None)
+
+        for cidr in as_list(cidr_field):
+            cidr = str(cidr).strip()
+            if cidr and "/" in cidr:
+                ranges[cidr] = {"asn": asn, "org": org, "cidr": cidr}
+
+    return list(ranges.values())
+
+
+def store_asn_ranges(conn: sqlite3.Connection, program_id: int, ranges: list[dict[str, Any]]) -> None:
+    if not ranges:
+        return
+    now = utc_now()
+    cur = conn.cursor()
+    for r in ranges:
+        cur.execute(
+            """
+            INSERT INTO asn_ranges (program_id, asn, org, cidr, discovered_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(program_id, cidr) DO UPDATE SET
+                asn=excluded.asn,
+                org=excluded.org
+            """,
+            (program_id, r.get("asn", ""), r.get("org", ""), r["cidr"], now),
+        )
+    conn.commit()
+
+
+def run_mapcidr_expand(cfg: Config, cidrs: list[str], job_dir: Path) -> list[str]:
+    """
+    Dedup/merge overlapping CIDRs, then expand to individual host IPs.
+    Two-stage mapcidr invocation matches upstream best practice: merge first
+    (collapses nested/overlapping ranges from multiple ASNs) then expand.
+    Hard-capped by cfg.asn_max_ips to avoid accidentally exploding a /8 into
+    16M hosts against a shared workdir.
+    """
+    if not cidrs:
+        return []
+    if cfg.dry_run:
+        logging.info("[DRY_RUN] Skipping mapcidr for %d CIDR(s)", len(cidrs))
+        return []
+
+    cidr_file = job_dir / "asn_cidrs.txt"
+    cidr_file.write_text("\n".join(sorted(set(cidrs))) + "\n", encoding="utf-8")
+
+    merged_file = job_dir / "asn_cidrs_merged.txt"
+    merge_cmd = [cfg.mapcidr_bin, "-cidr", str(cidr_file), "-silent"]
+    proc = run_cmd(merge_cmd, timeout=cfg.mapcidr_timeout)
+    merged_text = proc.stdout.strip()
+    if not merged_text:
+        logging.warning("mapcidr merge produced no output, falling back to raw CIDR list")
+        merged_text = "\n".join(sorted(set(cidrs)))
+    merged_file.write_text(merged_text + "\n", encoding="utf-8")
+
+    # Sanity check total host count before expansion to avoid runaway memory/disk use.
+    count_cmd = [cfg.mapcidr_bin, "-cidr", str(merged_file), "-count", "-silent"]
+    count_proc = run_cmd(count_cmd, timeout=cfg.mapcidr_timeout)
+    total_hosts = 0
+    for line in count_proc.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            total_hosts += int(line)
+        elif ":" in line:
+            # some mapcidr versions emit "<cidr>: <count>"
+            tail = line.rsplit(":", 1)[-1].strip()
+            if tail.isdigit():
+                total_hosts += int(tail)
+
+    if total_hosts > cfg.asn_max_ips:
+        logging.warning(
+            "ASN expansion would yield %d IPs, exceeding ASN_MAX_IPS=%d. "
+            "Skipping expansion for this cycle — narrow scope or raise the limit explicitly.",
+            total_hosts, cfg.asn_max_ips,
+        )
+        return []
+
+    # mapcidr with a plain -cidr flag and no -aggregate/-count/-stats writes the
+    # expanded individual host list (one IP per line) to stdout.
+    ips_proc = run_cmd(
+        [cfg.mapcidr_bin, "-cidr", str(merged_file), "-silent"],
+        timeout=cfg.mapcidr_timeout,
+    )
+
+    ips: list[str] = []
+    seen: set[str] = set()
+    for line in ips_proc.stdout.splitlines():
+        ip = line.strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+
+    ips_file = job_dir / "asn_ips.txt"
+    ips_file.write_text("\n".join(ips) + "\n", encoding="utf-8")
+
+    return ips
+
+
+def store_asn_ips(conn: sqlite3.Connection, program_id: int, ips: list[str]) -> None:
+    """Upserts discovered IPs. Alive/last_checked_at are set later by run_asn_alive_check."""
+    if not ips:
+        return
+    now = utc_now()
+    cur = conn.cursor()
+    for ip in ips:
+        cur.execute(
+            """
+            INSERT INTO asn_ips (program_id, ip, first_seen, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(program_id, ip) DO UPDATE SET last_seen=excluded.last_seen
+            """,
+            (program_id, ip, now, now),
+        )
+    conn.commit()
+
+
+def run_asn_alive_check(cfg: Config, ips: list[str], job_dir: Path) -> list[str]:
+    """
+    Liveness sweep on ASN-derived IPs using naabu against a small common-port set.
+    Kept separate from the main run_naabu (full port scan on subdomains) because:
+      1. Different input volume profile (can be thousands of raw IPs vs known hosts)
+      2. We only need liveness here, not full port enumeration
+      3. CDN-fronted IPs are noise for ASN-based org attribution and should be
+         filtered before they ever reach the main naabu/nuclei stages
+    Alive IPs are handed back to the caller to be merged into the main pipeline's
+    live_hosts list, so they get the SAME full naabu deep scan as subdomains —
+    avoiding a duplicate/divergent scanning code path.
+    """
+    if not ips:
+        return []
+    if cfg.dry_run:
+        logging.info("[DRY_RUN] Skipping ASN alive check for %d IP(s)", len(ips))
+        return []
+
+    ip_file = job_dir / "asn_ips_for_alive_check.txt"
+    ip_file.write_text("\n".join(ips) + "\n", encoding="utf-8")
+
+    out_file = job_dir / "asn_alive.jsonl"
+    cmd = [
+        cfg.naabu_bin,
+        "-list", str(ip_file),
+        "-top-ports", "100",
+        "-Pn",
+        "-verify",
+        "-json",
+        "-silent",
+        "-o", str(out_file),
+    ]
+    if cfg.asn_exclude_cdn:
+        cmd.append("-exclude-cdn")
+
+    proc = run_cmd(cmd, timeout=cfg.asn_alive_timeout)
+
+    alive: list[str] = []
+    seen: set[str] = set()
+
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
+
+    for line in iter_lines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        ip = str(first_value(obj, ["ip", "host"], "")).strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            alive.append(ip)
+
+    return alive
+
+
+def mark_asn_ips_alive(conn: sqlite3.Connection, program_id: int, alive_ips: list[str]) -> None:
+    if not alive_ips:
+        return
+    now = utc_now()
+    cur = conn.cursor()
+    cur.executemany(
+        "UPDATE asn_ips SET alive=1, last_checked_at=? WHERE program_id=? AND ip=?",
+        [(now, program_id, ip) for ip in alive_ips],
+    )
+    conn.commit()
+
+
+def run_asn_recon(cfg: Config, roots: list[str], job_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """
+    Full ASN recon stage: domains -> ASN/CIDR -> merged/expanded IPs -> alive check.
+
+    IMPORTANT: this function does NOT touch the sqlite3 connection. It is designed to
+    run inside a ThreadPoolExecutor worker alongside run_subfinder, and sqlite3
+    connections created with default check_same_thread=True (see connect_db) will
+    raise ProgrammingError if used from a thread other than the one that created them.
+    All DB persistence (store_asn_ranges/store_asn_ips/mark_asn_ips_alive) must be
+    called by the caller on the main thread after this returns.
+
+    Returns (asn_ranges, expanded_ips, alive_ips). Safe to no-op via ASN_ENABLED=false.
+    Every sub-step degrades gracefully (empty list) on tool failure or dry_run, so this
+    never raises — a failed ASN lookup should never abort the rest of the recon cycle.
+    """
+    if not cfg.asn_enabled:
+        return [], [], []
+
+    asn_ranges = run_asnmap(cfg, roots, job_dir)
+    if not asn_ranges:
+        logging.info("ASN recon: no ASN/CIDR data resolved for scope roots")
+        return [], [], []
+
+    cidrs = [r["cidr"] for r in asn_ranges]
+    ips = run_mapcidr_expand(cfg, cidrs, job_dir)
+    if not ips:
+        logging.info("ASN recon: no IPs expanded from %d CIDR(s)", len(cidrs))
+        return asn_ranges, [], []
+
+    alive_ips = run_asn_alive_check(cfg, ips, job_dir)
+    logging.info(
+        "ASN recon: %d CIDR(s) -> %d IP(s) expanded -> %d alive",
+        len(cidrs), len(ips), len(alive_ips),
+    )
+    return asn_ranges, ips, alive_ips
+
+
+# -----------------------------
 # nuclei
 # -----------------------------
 
@@ -1501,8 +1859,39 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
     conn.commit()
 
     try:
-        discovered = run_subfinder(cfg, roots, job_dir)
-        logging.info("[%s] Step 1 - subfinder completed successfully", program_name)
+        # ASN recon is independent of subdomain enumeration (it queries ASN/BGP data
+        # keyed on the root domains/org, not on discovered hosts) and is run in
+        # parallel with subfinder. Deliberately placed BEFORE the `if not new_hosts`
+        # early-return below — ASN-derived IPs must still get scanned on steady-state
+        # cycles where subfinder finds nothing new, otherwise this stage would
+        # effectively only ever fire on the very first run.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            subfinder_future = pool.submit(run_subfinder, cfg, roots, job_dir)
+            asn_future = pool.submit(run_asn_recon, cfg, roots, job_dir)
+
+            discovered = subfinder_future.result()
+            logging.info("[%s] Step 1 - subfinder completed successfully", program_name)
+
+            asn_ranges, asn_ips, asn_alive_ips = asn_future.result()
+
+        # All sqlite3 writes happen here on the main thread — see run_asn_recon docstring.
+        if cfg.asn_enabled:
+            store_asn_ranges(conn, program_id, asn_ranges)
+            store_asn_ips(conn, program_id, asn_ips)
+            mark_asn_ips_alive(conn, program_id, asn_alive_ips)
+            logging.info(
+                "[%s] Step 1b - ASN recon completed: %d range(s), %d IP(s) expanded, %d alive",
+                program_name, len(asn_ranges), len(asn_ips), len(asn_alive_ips),
+            )
+            if cfg.notify_step_by_step and asn_ranges:
+                lines = [f"[{program_name}] **ASN recon finished**: {len(asn_ranges)} range(s), {len(asn_alive_ips)} alive IP(s)"]
+                if asn_alive_ips:
+                    lines.append("\n**Alive IPs**")
+                    for ip in asn_alive_ips[:15]:
+                        lines.append(f"- {ip}")
+                    if len(asn_alive_ips) > 15:
+                        lines.append(f"*...and {len(asn_alive_ips) - 15} more*")
+                send_notify(cfg, "\n".join(lines).strip())
 
         new_hosts, seen_hosts = update_subdomains(conn, program_id, discovered)
         total_db_hosts = cur.execute("SELECT COUNT(*) FROM subdomains WHERE program_id=?", (program_id,)).fetchone()[0]
@@ -1530,7 +1919,12 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         )
         conn.commit()
 
-        if not new_hosts:
+        # Only short-circuit here if subfinder found nothing new AND ASN recon found no
+        # alive IPs to scan. Without the asn_alive_ips check, ASN-derived IPs would
+        # silently never reach naabu on any steady-state cycle (i.e. every cycle after
+        # the first, once subdomain enumeration has stabilized) — the ASN stage would
+        # effectively be dead code beyond the initial run.
+        if not new_hosts and not asn_alive_ips:
             cur.execute(
                 "UPDATE runs SET finished_at=?, status='ok' WHERE id=?",
                 (utc_now(), run_id),
@@ -1552,7 +1946,8 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
             )
             return
 
-        (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
+        if new_hosts:
+            (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
 
         httpx_results, live_hosts = run_httpx(cfg, new_hosts, job_dir)
         logging.info("[%s] Step 2 - httpx completed successfully", program_name)
@@ -1561,6 +1956,20 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         logging.info("[%s] Saved in database", program_name)
 
         live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
+
+        # Merge ASN-derived alive IPs into the same live_hosts list that feeds naabu.
+        # This gives ASN IPs the SAME full deep port scan as subdomains via the existing
+        # run_naabu call below, rather than a separate/divergent scanning code path.
+        # These IPs have no corresponding httpx/live_urls entry (no hostname to probe),
+        # so they only flow through the naabu port-scan side, not katana/nuclei.
+        if asn_alive_ips:
+            existing = set(live_hosts)
+            merged_in = [ip for ip in asn_alive_ips if ip not in existing]
+            live_hosts = live_hosts + merged_in
+            logging.info(
+                "[%s] merged %d ASN-derived alive IP(s) into naabu target list (%d total live hosts)",
+                program_name, len(merged_in), len(live_hosts),
+            )
 
         if cfg.notify_step_by_step:
             lines = [f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live."]
@@ -1910,11 +2319,20 @@ def load_config() -> Config:
         katana_crawl_js=env.get("KATANA_CRAWL_JS", "true").strip().lower() in ("true", "1", "yes"),
         katana_field_scope=env.get("KATANA_FIELD_SCOPE", "rdn"),
         katana_custom_scope=env.get("KATANA_CUSTOM_SCOPE", ""),
+        asnmap_bin=env.get("ASNMAP_BIN", "asnmap"),
+        mapcidr_bin=env.get("MAPCIDR_BIN", "mapcidr"),
+        asn_enabled=env.get("ASN_ENABLED", "true").strip().lower() in ("true", "1", "yes"),
+        asn_timeout=int(env.get("ASN_TIMEOUT", "900")),
+        mapcidr_timeout=int(env.get("MAPCIDR_TIMEOUT", "300")),
+        asn_alive_timeout=int(env.get("ASN_ALIVE_TIMEOUT", "1800")),
+        asn_max_ips=int(env.get("ASN_MAX_IPS", "65536")),
+        asn_exclude_cdn=env.get("ASN_EXCLUDE_CDN", "true").strip().lower() in ("true", "1", "yes"),
         subfinder_args=env.get("SUBFINDER_ARGS", ""),
         httpx_args=env.get("HTTPX_ARGS", ""),
         naabu_args=env.get("NAABU_ARGS", ""),
         nuclei_args=env.get("NUCLEI_ARGS", ""),
         katana_args=env.get("KATANA_ARGS", ""),
+        asnmap_args=env.get("ASNMAP_ARGS", ""),
         notify_args=env.get("NOTIFY_ARGS", ""),
         max_job_retention_days=int(env["MAX_JOB_RETENTION_DAYS"]),
         dry_run=env["DRY_RUN"].strip().lower() in ("true", "1", "yes"),
