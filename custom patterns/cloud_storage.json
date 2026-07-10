@@ -1,0 +1,82 @@
+[
+  {
+    "name": "STORAGE_AWS_S3",
+    "label": "AWS S3 Bucket URLs",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://(?:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\\.)?s3(?:[.-][a-z0-9-]+)?\\.amazonaws\\.com(?:/[^\\s\\\"'<>]*)?|\\bhttps?://[a-z0-9][a-z0-9.-]{2,63}\\.s3(?:[.-][a-z0-9-]+)?\\.amazonaws\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 1
+  },
+  {
+    "name": "STORAGE_GCS",
+    "label": "Google Cloud Storage",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://storage\\.googleapis\\.com/[^\\s\\\"'<>]+|\\bhttps?://[a-z0-9._-]+\\.storage\\.googleapis\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 2
+  },
+  {
+    "name": "STORAGE_AZURE_BLOB",
+    "label": "Azure Blob Storage",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://[a-z0-9-]+\\.blob\\.core\\.windows\\.net(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 3
+  },
+  {
+    "name": "STORAGE_CLOUDFLARE_R2",
+    "label": "Cloudflare R2",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://[a-f0-9]{32}\\.r2\\.cloudflarestorage\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 4
+  },
+  {
+    "name": "STORAGE_DIGITALOCEAN_SPACES",
+    "label": "DigitalOcean Spaces",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://[a-z0-9.-]+\\.[a-z0-9-]+\\.digitaloceanspaces\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 5
+  },
+  {
+    "name": "STORAGE_BACKBLAZE_B2",
+    "label": "Backblaze B2",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://f\\d{3}\\.backblazeb2\\.com/file/[^\\s\\\"'<>]+",
+    "priority": 5,
+    "group_index": 6
+  },
+  {
+    "name": "STORAGE_FIREBASE",
+    "label": "Firebase Storage",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://firebasestorage\\.googleapis\\.com/v0/b/[^\\s\\\"'<>]+",
+    "priority": 5,
+    "group_index": 7
+  },
+  {
+    "name": "STORAGE_ALIBABA_OSS",
+    "label": "Alibaba OSS",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://[a-z0-9.-]+\\.oss-[a-z0-9-]+\\.aliyuncs\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 8
+  },
+  {
+    "name": "STORAGE_ORACLE_OBJECT",
+    "label": "Oracle Object Storage",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://objectstorage\\.[a-z0-9-]+\\.oraclecloud\\.com(?:/[^\\s\\\"'<>]*)?",
+    "priority": 5,
+    "group_index": 9
+  },
+  {
+    "name": "STORAGE_MINIO",
+    "label": "MinIO",
+    "color": "orange",
+    "regex": "(?i)\\bhttps?://[^\\s\\\"'<>]+/minio(?:/[^\\s\\\"'<>]*)?",
+    "priority": 3,
+    "group_index": 10
+  }
+]

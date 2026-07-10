@@ -1,0 +1,37 @@
+{
+  "_comment": "Add your custom regex patterns here. The script loads this automatically on startup.",
+  "custom_patterns": [
+    {
+      "name": "STRIPE_KEY",
+      "label": "Stripe Key",
+      "color": "red",
+      "regex": "sk_live_[a-zA-Z0-9]{24,}",
+      "priority": 1,
+      "group_index": 0
+    },
+    {
+      "name": "SENDGRID_KEY",
+      "label": "SendGrid Key",
+      "color": "red",
+      "regex": "SG\\.[a-zA-Z0-9_-]{22}\\.[a-zA-Z0-9_-]{43}",
+      "priority": 1,
+      "group_index": 0
+    },
+    {
+      "name": "TWILIO_KEY",
+      "label": "Twilio Key",
+      "color": "red",
+      "regex": "SK[0-9a-fA-F]{32}",
+      "priority": 1,
+      "group_index": 0
+    },
+    {
+      "name": "SHOPIFY_KEY",
+      "label": "Shopify Key",
+      "color": "red",
+      "regex": "shpat_[a-fA-F0-9]{32}",
+      "priority": 1,
+      "group_index": 0
+    }
+  ]
+}

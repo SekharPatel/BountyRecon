@@ -142,6 +142,7 @@ class Config:
     katana_depth: int = 3
     katana_headless: bool = False
     katana_crawl_js: bool = True
+    katana_jsluice: bool = False
     katana_field_scope: str = "rdn"
     katana_custom_scope: str = ""
     asn_enabled: bool = True
@@ -160,13 +161,10 @@ class Config:
     js_monitor_enabled: bool = True
     js_monitor_threads: int = 15
     js_monitor_timeout: int = 30
-    js_monitor_max_file_size: int = 10 * 1024 * 1024
     js_monitor_recursion_depth: int = 3
     js_monitor_deep: bool = False
-    js_monitor_proxy: str = ""
     js_monitor_patterns_file: str = ""
     js_monitor_allow_external: bool = False
-    js_notify_critical_only: bool = False
     max_job_retention_days: int = 30
     dry_run: bool = False
 
@@ -296,6 +294,60 @@ CREATE TABLE IF NOT EXISTS katana_results (
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS js_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    source_url TEXT,
+    current_hash TEXT,
+    content_length INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_changed_at TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE,
+    UNIQUE(program_id, url)
+);
+
+CREATE TABLE IF NOT EXISTS js_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id INTEGER NOT NULL,
+    js_file_id INTEGER,
+    source_url TEXT,
+    source_type TEXT NOT NULL DEFAULT 'javascript',
+    category TEXT NOT NULL,
+    value TEXT NOT NULL,
+    context TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE,
+    FOREIGN KEY(js_file_id) REFERENCES js_files(id) ON DELETE SET NULL,
+    UNIQUE(program_id, source_type, category, value)
+);
+
+CREATE TABLE IF NOT EXISTS js_scan_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER,
+    program_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    seed_pages INTEGER NOT NULL DEFAULT 0,
+    direct_js_urls INTEGER NOT NULL DEFAULT 0,
+    html_pages_scanned INTEGER NOT NULL DEFAULT 0,
+    js_files_found INTEGER NOT NULL DEFAULT 0,
+    js_files_scanned INTEGER NOT NULL DEFAULT 0,
+    js_files_changed INTEGER NOT NULL DEFAULT 0,
+    findings_total INTEGER NOT NULL DEFAULT 0,
+    findings_new INTEGER NOT NULL DEFAULT 0,
+    findings_removed INTEGER NOT NULL DEFAULT 0,
+    critical_new INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ok',
+    error TEXT,
+    FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE SET NULL,
+    FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS asn_ranges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     program_id INTEGER NOT NULL,
@@ -342,6 +394,12 @@ CREATE TABLE IF NOT EXISTS runs (
     live_subdomains INTEGER NOT NULL DEFAULT 0,
     nuclei_findings INTEGER NOT NULL DEFAULT 0,
     katana_urls INTEGER NOT NULL DEFAULT 0,
+    js_files_found INTEGER NOT NULL DEFAULT 0,
+    js_files_changed INTEGER NOT NULL DEFAULT 0,
+    js_findings_total INTEGER NOT NULL DEFAULT 0,
+    js_findings_new INTEGER NOT NULL DEFAULT 0,
+    js_findings_removed INTEGER NOT NULL DEFAULT 0,
+    js_findings_critical INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'running',
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
@@ -359,12 +417,17 @@ CREATE INDEX IF NOT EXISTS idx_nuclei_program ON nuclei_findings(program_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_program ON artifacts(program_id);
 CREATE INDEX IF NOT EXISTS idx_katana_program ON katana_results(program_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nuclei_unique ON nuclei_findings(program_id, subdomain, template_id, url);
+CREATE INDEX IF NOT EXISTS idx_js_files_program ON js_files(program_id);
+CREATE INDEX IF NOT EXISTS idx_js_files_active ON js_files(program_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_js_findings_program ON js_findings(program_id);
+CREATE INDEX IF NOT EXISTS idx_js_findings_active ON js_findings(program_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_js_scan_history_program ON js_scan_history(program_id);
 CREATE INDEX IF NOT EXISTS idx_asn_ranges_program ON asn_ranges(program_id);
 CREATE INDEX IF NOT EXISTS idx_asn_ips_program ON asn_ips(program_id);
 """
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -389,6 +452,21 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             # v4: asn_ranges / asn_ips tables created via CREATE TABLE IF NOT EXISTS above.
             # Nothing to backfill; version bump only.
             pass
+        if current < 5:
+            # v5: JavaScript monitoring tables are created by SCHEMA above; existing
+            # databases only need the new run counters added defensively.
+            for column in (
+                "js_files_found INTEGER NOT NULL DEFAULT 0",
+                "js_files_changed INTEGER NOT NULL DEFAULT 0",
+                "js_findings_total INTEGER NOT NULL DEFAULT 0",
+                "js_findings_new INTEGER NOT NULL DEFAULT 0",
+                "js_findings_removed INTEGER NOT NULL DEFAULT 0",
+                "js_findings_critical INTEGER NOT NULL DEFAULT 0",
+            ):
+                try:
+                    cur.execute(f"ALTER TABLE runs ADD COLUMN {column}")
+                except sqlite3.OperationalError:
+                    pass
         if current < CURRENT_SCHEMA_VERSION:
             cur.execute(
                 "UPDATE schema_version SET version=?, updated_at=?",
@@ -516,6 +594,881 @@ def host_from_url(url: str) -> str:
 
 
 # -----------------------------
+# JavaScript monitor
+# -----------------------------
+
+JS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+JS_SKIP_DOMAINS = {
+    "www.googletagmanager.com",
+    "www.google-analytics.com",
+    "connect.facebook.net",
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "cdn.skypack.dev",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "cdn.shopify.com",
+    "hcaptcha.com",
+    "challenges.cloudflare.com",
+    "static.cloudflareinsights.com",
+}
+
+JS_CRITICAL_CATEGORIES = {
+    "api_key",
+    "aws_key",
+    "aws_secret",
+    "google_api_key",
+    "credential",
+    "jwt",
+}
+
+PATTERN_PATHS = re.compile(
+    r'''(?:"|'|`|\()(/(?:[a-zA-Z0-9_\-./~@:{}]+/?)*[a-zA-Z0-9_\-./~@:{}]*)["'`\)]?'''
+)
+PATTERN_URLS = re.compile(r'''https?://[^\s"'`<>\)\]\},]+''')
+PATTERN_QUERY_PARAMS = re.compile(r"[?&]([a-zA-Z_][a-zA-Z0-9_]*)=")
+PATTERN_FEATURE_FLAGS = re.compile(
+    r'''(?:"|'|`)((?:feature[_\s-]?flag|feature[_\s-]?toggle|enable[_\s-]?|'''
+    r'''disable[_\s-]?|is[_\s-]?enabled|use[_\s-]?new|show[_\s-]?|hide[_\s-]?|'''
+    r'''experiment|ab[_\s-]?test|rollout|beta[_\s-]?|new[_\s-]?ui|'''
+    r'''can[_\s-]?|should[_\s-]?|has[_\s-]?)[a-zA-Z0-9_\-]*)["'`\)]?\s*[:=]''',
+    re.IGNORECASE,
+)
+PATTERN_API_KEY_CONTEXT = re.compile(
+    r'''(?i)(?:api[_\s-]?key|apikey|access[_\s-]?key|secret[_\s-]?key|'''
+    r'''private[_\s-]?key|auth[_\s-]?token|bearer|session[_\s-]?token|'''
+    r'''client[_\s-]?secret|app[_\s-]?secret|signing[_\s-]?key|'''
+    r'''encryption[_\s-]?key|webhook[_\s-]?secret|publishable[_\s-]?key)'''
+    r'''[\s"':=]+(["'`])([a-zA-Z0-9_\-+/=.]{16,})\1'''
+)
+PATTERN_AWS_KEY = re.compile(r"AKIA[0-9A-Z]{16}")
+PATTERN_AWS_SECRET = re.compile(
+    r'''(?:aws[_\s-]?secret|secret[_\s-]?access[_\s-]?key)[\s"':=]+(["'`])([A-Za-z0-9/+=]{40})\1''',
+    re.IGNORECASE,
+)
+PATTERN_GOOGLE_KEY = re.compile(r"AIza[0-9A-Za-z\-_]{35}")
+PATTERN_GENERIC_TOKEN = re.compile(
+    r'''["'`](eyJ[a-zA-Z0-9_-]{20,}\.eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,})["'`]'''
+)
+PATTERN_CREDENTIALS = re.compile(
+    r'''(?i)(?:password|passwd|pwd|credential|secret|token)\s*[:=]\s*["'`]([^"'\s]{4,})["'`]'''
+)
+PATTERN_INTERNAL_IPS = re.compile(
+    r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"127\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"
+)
+PATTERN_COMMENTS = re.compile(r"/\*[\s\S]*?\*/|//.*?$", re.MULTILINE)
+PATTERN_FETCH_ENDPOINT = re.compile(
+    r'''(?:fetch|axios|\.get|\.post|\.put|\.delete|\.patch|XMLHttpRequest|\.ajax)\s*\(\s*["'`]([^"'`]+)["'`]''',
+    re.IGNORECASE,
+)
+PATTERN_GRAPHQL = re.compile(r'''["'`](/graphql|/api/graphql|/gql|/query)["'`]''', re.IGNORECASE)
+PATTERN_WEBSOCKET = re.compile(r'''(?:new\s+WebSocket\s*\(\s*["'`])?(wss?://[^"'`\s<>)]+)''', re.IGNORECASE)
+PATTERN_DYNAMIC_IMPORT = re.compile(r'''import\s*\(\s*["'`]([^"'`]+\.js(?:\?[^"'`]*)?)["'`]\s*\)''')
+PATTERN_WEBPACK_CHUNK_MAP = re.compile(r'''["'](\d+)["']\s*:\s*["']([^"']+\.js[^"']*)["']''')
+PATTERN_WEBPACK_PUBLIC_PATH = re.compile(r'''__webpack_require__\.p\s*=\s*["']([^"']+)["']''')
+PATTERN_JS_REF_IN_JS = re.compile(
+    r'''["'`]((?:[./]*)(?:[a-zA-Z0-9_\-./]+/)*[a-zA-Z0-9_\-]+\.js(?:\?[^"'`]*)?)["'`]'''
+)
+PATTERN_NEXTJS_CHUNK = re.compile(r'''["_'](/?_next/static/(?:chunks|css)/[^"']+\.js)["']''')
+PATTERN_NUXT_CHUNK = re.compile(r'''["_'](/?_nuxt/[^"']+\.js)["']''')
+PATTERN_VITE_CHUNK = re.compile(r'''["_'](/?assets/[^"']+\.js)["']''')
+PATTERN_SERVICE_WORKER = re.compile(
+    r'''(?:navigator\.serviceWorker\.register|registerServiceWorker)\s*\(\s*["'`]([^"'`]+)["'`]'''
+)
+
+_js_thread_local = threading.local()
+
+
+class ScriptDiscoveringHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.script_srcs: list[str] = []
+        self.modulepreload_hrefs: list[str] = []
+        self.inline_scripts: list[str] = []
+        self._capture_script = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attr_map = {k.lower(): v or "" for k, v in attrs}
+        tag = tag.lower()
+        if tag == "script":
+            src = attr_map.get("src", "").strip()
+            if src:
+                self.script_srcs.append(html.unescape(src))
+            else:
+                self._capture_script = True
+        elif tag == "link":
+            rel = attr_map.get("rel", "").lower()
+            href = attr_map.get("href", "").strip()
+            if href and "modulepreload" in rel and is_probable_js_url(href):
+                self.modulepreload_hrefs.append(html.unescape(href))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self._capture_script = False
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_script and data:
+            self.inline_scripts.append(data)
+
+
+def dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def normalize_monitor_url(url: str, base: str = "") -> str:
+    url = html.unescape(str(url or "").strip())
+    if not url:
+        return ""
+    if base:
+        url = urllib.parse.urljoin(base, url)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    return urllib.parse.urlunparse(parsed._replace(fragment=""))
+
+
+def is_probable_js_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith(".js") or ".js/" in path or ".js;" in path or ".js?" in url.lower()
+
+
+def url_in_scope(url: str, roots: list[str], allow_external: bool) -> bool:
+    if allow_external:
+        return True
+    host = host_from_url(url).lower().rstrip(".")
+    if not host:
+        return False
+    return any(host == root.lower().rstrip(".") or host.endswith("." + root.lower().rstrip(".")) for root in roots)
+
+
+def filter_monitor_urls(urls: list[str], roots: list[str], allow_external: bool, js_only: bool = False) -> list[str]:
+    filtered: list[str] = []
+    for url in urls:
+        normalized = normalize_monitor_url(url)
+        if not normalized:
+            continue
+        host = host_from_url(normalized).lower().rstrip(".")
+        if host in JS_SKIP_DOMAINS and not allow_external:
+            continue
+        if js_only and not is_probable_js_url(normalized):
+            continue
+        if url_in_scope(normalized, roots, allow_external):
+            filtered.append(normalized)
+    return dedupe_strings(filtered)
+
+
+def get_js_opener() -> urllib.request.OpenerDirector:
+    opener = getattr(_js_thread_local, "opener", None)
+    if opener is None:
+        opener = urllib.request.build_opener()
+        _js_thread_local.opener = opener
+    return opener
+
+
+def fetch_monitor_url(cfg: Config, url: str, js_file: bool = False) -> Optional[str]:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": JS_USER_AGENT,
+                "Accept": "*/*" if js_file else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+        )
+        with get_js_opener().open(req, timeout=cfg.js_monitor_timeout) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            try:
+                return raw.decode(charset, errors="replace")
+            except LookupError:
+                return raw.decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def fetch_monitor_batch(cfg: Config, urls: list[str], js_file: bool = False) -> dict[str, Optional[str]]:
+    if not urls:
+        return {}
+    results: dict[str, Optional[str]] = {}
+    workers = max(1, min(cfg.js_monitor_threads, len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_monitor_url, cfg, url, js_file): url for url in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                results[url] = future.result()
+            except Exception:
+                results[url] = None
+    return results
+
+
+def discover_js_html(html_text: str, base: str) -> list[str]:
+    parser = ScriptDiscoveringHTMLParser()
+    try:
+        parser.feed(html_text)
+    except Exception:
+        pass
+
+    found: list[str] = []
+    for src in parser.script_srcs + parser.modulepreload_hrefs:
+        found.append(normalize_monitor_url(src, base))
+    for script in parser.inline_scripts:
+        for match in re.finditer(r'''["']([^"']*\.js(?:\?[^"']*)?)["']''', script):
+            found.append(normalize_monitor_url(match.group(1), base))
+    for match in re.finditer(r'''["']((?:/[^"']*/)*[^"']*\.js(?:\?[^"']*)?)["']''', html_text):
+        found.append(normalize_monitor_url(match.group(1), base))
+    return filter_monitor_urls(found, [], True, js_only=True)
+
+
+def get_webpack_public_path(content: str) -> str:
+    match = PATTERN_WEBPACK_PUBLIC_PATH.search(content)
+    return match.group(1) if match else ""
+
+
+def discover_js_from_js(content: str, base: str, public_path: str = "") -> list[str]:
+    found: list[str] = []
+
+    def resolve(raw: str) -> str:
+        raw = raw.strip()
+        if public_path and not raw.startswith(("/", "http://", "https://")):
+            raw = public_path + raw
+        return normalize_monitor_url(raw, base)
+
+    for match in PATTERN_DYNAMIC_IMPORT.finditer(content):
+        found.append(resolve(match.group(1)))
+    for match in PATTERN_WEBPACK_CHUNK_MAP.finditer(content):
+        found.append(resolve(match.group(2)))
+    for pattern in (PATTERN_NEXTJS_CHUNK, PATTERN_NUXT_CHUNK, PATTERN_VITE_CHUNK):
+        for match in pattern.finditer(content):
+            found.append(resolve(match.group(1)))
+    for match in PATTERN_JS_REF_IN_JS.finditer(content):
+        raw = match.group(1)
+        if "/" in raw or raw.startswith("."):
+            found.append(resolve(raw))
+    for match in PATTERN_SERVICE_WORKER.finditer(content):
+        found.append(resolve(match.group(1)))
+
+    return filter_monitor_urls(found, [], True, js_only=True)
+
+
+def fetch_sitemap_routes(cfg: Config, base: str, roots: list[str]) -> list[str]:
+    parsed = urllib.parse.urlparse(base)
+    if not parsed.scheme or not parsed.netloc:
+        return []
+    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+    body = fetch_monitor_url(cfg, sitemap_url, js_file=False)
+    if not body:
+        return []
+
+    routes: list[str] = []
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return []
+
+    namespaces = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    sitemap_locs = [loc.text.strip() for loc in root.findall(".//sm:sitemap/sm:loc", namespaces) if loc.text]
+    page_locs = [loc.text.strip() for loc in root.findall(".//sm:loc", namespaces) if loc.text]
+    routes.extend(page_locs)
+
+    for nested in sitemap_locs[:5]:
+        nested_body = fetch_monitor_url(cfg, nested, js_file=False)
+        if not nested_body:
+            continue
+        try:
+            nested_root = ET.fromstring(nested_body)
+        except ET.ParseError:
+            continue
+        routes.extend([loc.text.strip() for loc in nested_root.findall(".//sm:loc", namespaces) if loc.text])
+
+    return filter_monitor_urls(routes, roots, cfg.js_monitor_allow_external, js_only=False)
+
+
+def context_slice(content: str, pos: int, width: int = 80) -> str:
+    start = max(0, pos - width)
+    end = min(len(content), pos + width)
+    return " ".join(content[start:end].replace("\r", " ").replace("\n", " ").split())
+
+
+def load_js_custom_patterns(config_path: str) -> list[dict[str, Any]]:
+    if not config_path:
+        return []
+    path = Path(config_path).expanduser()
+    if not path.exists():
+        logging.warning("JS monitor custom regex config not found: %s", path)
+        return []
+
+    try:
+        config = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Failed to load JS custom regex config %s: %s", path, exc)
+        return []
+
+    patterns: list[dict[str, Any]] = []
+    for entry in config.get("custom_patterns", []):
+        name = str(entry.get("name", "")).strip()
+        regex = str(entry.get("regex", "")).strip()
+        if not name or not regex:
+            logging.warning("Skipping JS custom regex entry missing name/regex")
+            continue
+        flags = re.IGNORECASE if entry.get("ignore_case", False) else 0
+        try:
+            compiled = re.compile(regex, flags)
+        except re.error as exc:
+            logging.warning("Skipping invalid JS custom regex %s: %s", name, exc)
+            continue
+        patterns.append(
+            {
+                "name": name,
+                "regex": compiled,
+                "group_index": int(entry.get("group_index", 0)),
+            }
+        )
+    return patterns
+
+
+def extract_monitor_findings(content: str, custom_patterns: list[dict[str, Any]], include_comments: bool = True) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(category: str, value: str, context: str = "") -> None:
+        value = ensure_utf8_text(value).strip()
+        if not value:
+            return
+        key = (category, value)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append({"category": category, "value": value, "context": ensure_utf8_text(context)})
+
+    for match in PATTERN_PATHS.finditer(content):
+        path = match.group(1)
+        if len(path) < 3 or path.startswith(("//", "/*")):
+            continue
+        if re.match(r"^/[a-z]", path, re.IGNORECASE) or "/api/" in path.lower():
+            add("path", path, context_slice(content, match.start()))
+
+    for match in PATTERN_URLS.finditer(content):
+        url = match.group(0).rstrip(".,;)")
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            continue
+        if parsed.netloc in JS_SKIP_DOMAINS and parsed.path in ("", "/"):
+            continue
+        add("url", url, context_slice(content, match.start()))
+        for param_match in PATTERN_QUERY_PARAMS.finditer(url):
+            add("parameter", param_match.group(1), f"From URL: {url[:120]}")
+
+    for match in PATTERN_FEATURE_FLAGS.finditer(content):
+        add("feature_flag", match.group(1), context_slice(content, match.start()))
+    for match in PATTERN_API_KEY_CONTEXT.finditer(content):
+        add("api_key", match.group(2), f"Context: {match.group(0)[:120]}")
+    for match in PATTERN_AWS_KEY.finditer(content):
+        add("aws_key", match.group(0), context_slice(content, match.start()))
+    for match in PATTERN_AWS_SECRET.finditer(content):
+        add("aws_secret", match.group(2), f"Context: {match.group(0)[:120]}")
+    for match in PATTERN_GOOGLE_KEY.finditer(content):
+        add("google_api_key", match.group(0), context_slice(content, match.start()))
+    for match in PATTERN_GENERIC_TOKEN.finditer(content):
+        token = match.group(1)
+        add("jwt", token[:80] + ("..." if len(token) > 80 else ""), context_slice(content, match.start()))
+    for match in PATTERN_CREDENTIALS.finditer(content):
+        value = match.group(1)
+        if value.lower() in ("null", "undefined", "true", "false", "''", '""', "``") or len(value) < 3:
+            continue
+        add("credential", value, context_slice(content, match.start()))
+    for match in PATTERN_INTERNAL_IPS.finditer(content):
+        add("internal_ip", match.group(0), context_slice(content, match.start()))
+
+    if include_comments:
+        for match in PATTERN_COMMENTS.finditer(content):
+            comment = match.group(0).strip()
+            lowered = comment.lower()
+            if any(
+                keyword in lowered
+                for keyword in (
+                    "todo",
+                    "fixme",
+                    "hack",
+                    "xxx",
+                    "bug",
+                    "vuln",
+                    "security",
+                    "temp",
+                    "temporary",
+                    "remove",
+                    "deprecated",
+                    "backdoor",
+                    "debug",
+                    "testing",
+                    "staging",
+                    "internal",
+                    "secret",
+                    "hardcoded",
+                )
+            ):
+                add("comment", comment[:200] + ("..." if len(comment) > 200 else ""), "")
+
+    for match in PATTERN_FETCH_ENDPOINT.finditer(content):
+        add("fetch_endpoint", match.group(1), context_slice(content, match.start()))
+    for match in PATTERN_GRAPHQL.finditer(content):
+        add("graphql_endpoint", match.group(1), context_slice(content, match.start()))
+    for match in PATTERN_WEBSOCKET.finditer(content):
+        add("websocket", match.group(1), context_slice(content, match.start()))
+
+    for pattern in custom_patterns:
+        for match in pattern["regex"].finditer(content):
+            try:
+                value = match.group(pattern["group_index"])
+            except IndexError:
+                continue
+            add(pattern["name"], value, context_slice(content, match.start()))
+
+    return findings
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def mask_sensitive_value(value: str) -> str:
+    value = ensure_utf8_text(value)
+    if len(value) <= 10:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def run_js_monitor_scan(
+    cfg: Config,
+    page_urls: list[str],
+    direct_js_urls: list[str],
+    roots: list[str],
+    job_dir: Path,
+) -> dict[str, Any]:
+    started_at = utc_now()
+    result: dict[str, Any] = {
+        "started_at": started_at,
+        "status": "ok",
+        "error": "",
+        "seed_page_urls": [],
+        "direct_js_urls": [],
+        "html_pages_scanned": 0,
+        "discovered_js_urls": [],
+        "fetched_js_urls": [],
+        "failed_page_urls": [],
+        "failed_js_urls": [],
+        "js_hashes": {},
+        "js_meta": {},
+        "findings": [],
+        "custom_patterns_loaded": 0,
+    }
+
+    if not cfg.js_monitor_enabled:
+        result["status"] = "disabled"
+        return result
+    if cfg.dry_run:
+        logging.info("[DRY_RUN] Skipping JS monitor")
+        result["status"] = "dry_run"
+        return result
+
+    custom_patterns = load_js_custom_patterns(cfg.js_monitor_patterns_file)
+    result["custom_patterns_loaded"] = len(custom_patterns)
+
+    seed_pages = filter_monitor_urls(page_urls, roots, cfg.js_monitor_allow_external, js_only=False)
+    seed_pages = [url for url in seed_pages if not is_probable_js_url(url)]
+    direct_js = filter_monitor_urls(direct_js_urls, roots, cfg.js_monitor_allow_external, js_only=True)
+    result["seed_page_urls"] = seed_pages
+    result["direct_js_urls"] = direct_js
+
+    discovered_js: set[str] = set(direct_js)
+    js_sources: dict[str, str] = {url: "katana" for url in direct_js}
+
+    if seed_pages:
+        page_bodies = fetch_monitor_batch(cfg, seed_pages, js_file=False)
+        for page_url, body in page_bodies.items():
+            if not body:
+                result["failed_page_urls"].append(page_url)
+                continue
+            result["html_pages_scanned"] += 1
+            html_findings = extract_monitor_findings(body, custom_patterns, include_comments=False)
+            for finding in html_findings:
+                finding.update({"source_url": page_url, "source_type": "html"})
+            result["findings"].extend(html_findings)
+
+            for js_url in filter_monitor_urls(discover_js_html(body, page_url), roots, cfg.js_monitor_allow_external, js_only=True):
+                discovered_js.add(js_url)
+                js_sources.setdefault(js_url, page_url)
+
+    if cfg.js_monitor_deep and seed_pages:
+        origins = dedupe_strings(
+            [
+                f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
+                for url in seed_pages
+                if urllib.parse.urlparse(url).scheme and urllib.parse.urlparse(url).netloc
+            ]
+        )
+        sitemap_pages: list[str] = []
+        for origin in origins:
+            sitemap_pages.extend(fetch_sitemap_routes(cfg, origin, roots)[:20])
+        sitemap_pages = [url for url in dedupe_strings(sitemap_pages) if url not in set(seed_pages)]
+        if sitemap_pages:
+            page_bodies = fetch_monitor_batch(cfg, sitemap_pages, js_file=False)
+            for page_url, body in page_bodies.items():
+                if not body:
+                    result["failed_page_urls"].append(page_url)
+                    continue
+                result["html_pages_scanned"] += 1
+                html_findings = extract_monitor_findings(body, custom_patterns, include_comments=False)
+                for finding in html_findings:
+                    finding.update({"source_url": page_url, "source_type": "html"})
+                result["findings"].extend(html_findings)
+                for js_url in filter_monitor_urls(discover_js_html(body, page_url), roots, cfg.js_monitor_allow_external, js_only=True):
+                    discovered_js.add(js_url)
+                    js_sources.setdefault(js_url, page_url)
+
+    attempted_js: set[str] = set()
+    fetched_js: set[str] = set()
+    public_path = ""
+    max_depth = max(1, cfg.js_monitor_recursion_depth)
+
+    for _depth in range(max_depth):
+        to_fetch = sorted(discovered_js - attempted_js)
+        if not to_fetch:
+            break
+        js_bodies = fetch_monitor_batch(cfg, to_fetch, js_file=True)
+        for js_url, body in js_bodies.items():
+            attempted_js.add(js_url)
+            if body is None:
+                result["failed_js_urls"].append(js_url)
+                continue
+            fetched_js.add(js_url)
+            content_bytes = body.encode("utf-8", errors="replace")
+            result["js_hashes"][js_url] = hashlib.sha256(content_bytes).hexdigest()
+            result["js_meta"][js_url] = {
+                "content_length": len(content_bytes),
+                "source_url": js_sources.get(js_url, ""),
+            }
+            js_findings = extract_monitor_findings(body, custom_patterns, include_comments=True)
+            for finding in js_findings:
+                finding.update({"source_url": js_url, "source_type": "javascript"})
+            result["findings"].extend(js_findings)
+
+            if not public_path:
+                public_path = get_webpack_public_path(body)
+            for child_js in filter_monitor_urls(discover_js_from_js(body, js_url, public_path), roots, cfg.js_monitor_allow_external, js_only=True):
+                discovered_js.add(child_js)
+                js_sources.setdefault(child_js, js_url)
+
+    result["discovered_js_urls"] = sorted(discovered_js)
+    result["fetched_js_urls"] = sorted(fetched_js)
+
+    (job_dir / "js_monitor_seed_pages.txt").write_text("\n".join(seed_pages) + "\n", encoding="utf-8")
+    (job_dir / "js_monitor_direct_js.txt").write_text("\n".join(direct_js) + "\n", encoding="utf-8")
+    (job_dir / "js_monitor_js_files.txt").write_text("\n".join(result["discovered_js_urls"]) + "\n", encoding="utf-8")
+    (job_dir / "js_monitor_failed_js.txt").write_text("\n".join(result["failed_js_urls"]) + "\n", encoding="utf-8")
+    write_jsonl(job_dir / "js_monitor_findings.jsonl", result["findings"])
+
+    return result
+
+
+def get_known_live_urls(conn: sqlite3.Connection, program_id: int) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT http_url
+        FROM subdomains
+        WHERE program_id=? AND alive=1 AND http_url IS NOT NULL AND http_url <> ''
+        ORDER BY http_url
+        """,
+        (program_id,),
+    ).fetchall()
+    return [str(row["http_url"]).strip() for row in rows if str(row["http_url"]).strip()]
+
+
+def upsert_js_file(
+    cur: sqlite3.Cursor,
+    program_id: int,
+    url: str,
+    content_hash: str,
+    source_url: str,
+    content_length: int,
+    ts: str,
+) -> tuple[int, str]:
+    row = cur.execute(
+        "SELECT id, current_hash, is_active FROM js_files WHERE program_id=? AND url=?",
+        (program_id, url),
+    ).fetchone()
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO js_files (
+                program_id, url, source_url, current_hash, content_length,
+                first_seen_at, last_seen_at, last_changed_at, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (program_id, url, source_url, content_hash, content_length, ts, ts, ts),
+        )
+        return int(cur.lastrowid), "new"
+
+    status = "unchanged"
+    if row["current_hash"] != content_hash:
+        status = "changed"
+    elif int(row["is_active"]) == 0:
+        status = "reactivated"
+
+    cur.execute(
+        """
+        UPDATE js_files
+        SET source_url=?, current_hash=?, content_length=?, last_seen_at=?,
+            last_changed_at=CASE WHEN current_hash <> ? THEN ? ELSE last_changed_at END,
+            is_active=1
+        WHERE id=?
+        """,
+        (source_url, content_hash, content_length, ts, content_hash, ts, int(row["id"])),
+    )
+    return int(row["id"]), status
+
+
+def deactivate_missing_js_files(cur: sqlite3.Cursor, program_id: int, seen_urls: set[str], ts: str) -> list[dict[str, Any]]:
+    rows = cur.execute(
+        "SELECT id, url, current_hash FROM js_files WHERE program_id=? AND is_active=1",
+        (program_id,),
+    ).fetchall()
+    removed = [dict(row) for row in rows if row["url"] not in seen_urls]
+    for row in removed:
+        cur.execute("UPDATE js_files SET is_active=0, last_seen_at=? WHERE id=?", (ts, row["id"]))
+    return removed
+
+
+def upsert_js_finding(
+    cur: sqlite3.Cursor,
+    program_id: int,
+    js_file_id: Optional[int],
+    source_url: str,
+    source_type: str,
+    category: str,
+    value: str,
+    context: str,
+    ts: str,
+) -> str:
+    row = cur.execute(
+        """
+        SELECT id, is_active
+        FROM js_findings
+        WHERE program_id=? AND source_type=? AND category=? AND value=?
+        """,
+        (program_id, source_type, category, value),
+    ).fetchone()
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO js_findings (
+                program_id, js_file_id, source_url, source_type, category, value,
+                context, first_seen_at, last_seen_at, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (program_id, js_file_id, source_url, source_type, category, value, context, ts, ts),
+        )
+        return "new"
+
+    status = "reactivated" if int(row["is_active"]) == 0 else "existing"
+    cur.execute(
+        """
+        UPDATE js_findings
+        SET js_file_id=?, source_url=?, context=?, last_seen_at=?, is_active=1
+        WHERE id=?
+        """,
+        (js_file_id, source_url, context, ts, int(row["id"])),
+    )
+    return status
+
+
+def deactivate_missing_js_findings(
+    cur: sqlite3.Cursor,
+    program_id: int,
+    seen_keys: set[tuple[str, str, str]],
+    ts: str,
+) -> list[dict[str, Any]]:
+    rows = cur.execute(
+        """
+        SELECT id, source_url, source_type, category, value, context
+        FROM js_findings
+        WHERE program_id=? AND is_active=1
+        """,
+        (program_id,),
+    ).fetchall()
+    removed = [
+        dict(row)
+        for row in rows
+        if (row["source_type"], row["category"], row["value"]) not in seen_keys
+    ]
+    for row in removed:
+        cur.execute("UPDATE js_findings SET is_active=0, last_seen_at=? WHERE id=?", (ts, row["id"]))
+    return removed
+
+
+def store_js_monitor_results(
+    conn: sqlite3.Connection,
+    program_id: int,
+    run_id: int,
+    result: dict[str, Any],
+    job_dir: Path,
+) -> dict[str, Any]:
+    ts = utc_now()
+    cur = conn.cursor()
+
+    changed_files: list[dict[str, Any]] = []
+    js_file_ids: dict[str, int] = {}
+    for js_url, content_hash in result.get("js_hashes", {}).items():
+        meta = result.get("js_meta", {}).get(js_url, {})
+        js_file_id, status = upsert_js_file(
+            cur,
+            program_id,
+            js_url,
+            content_hash,
+            ensure_utf8_text(meta.get("source_url", "")),
+            int(meta.get("content_length", 0) or 0),
+            ts,
+        )
+        js_file_ids[js_url] = js_file_id
+        if status in ("new", "changed", "reactivated"):
+            changed_files.append(
+                {
+                    "url": js_url,
+                    "status": status,
+                    "hash": content_hash,
+                    "source_url": ensure_utf8_text(meta.get("source_url", "")),
+                }
+            )
+
+    removed_js = deactivate_missing_js_files(
+        cur,
+        program_id,
+        set(result.get("discovered_js_urls", [])),
+        ts,
+    ) if result.get("discovered_js_urls") else []
+
+    new_findings: list[dict[str, Any]] = []
+    seen_finding_keys: set[tuple[str, str, str]] = set()
+    for finding in result.get("findings", []):
+        source_type = ensure_utf8_text(finding.get("source_type", "javascript")) or "javascript"
+        source_url = ensure_utf8_text(finding.get("source_url", ""))
+        category = ensure_utf8_text(finding.get("category", ""))
+        value = ensure_utf8_text(finding.get("value", ""))
+        context = ensure_utf8_text(finding.get("context", ""))
+        if not category or not value:
+            continue
+        js_file_id = js_file_ids.get(source_url) if source_type == "javascript" else None
+        status = upsert_js_finding(
+            cur,
+            program_id,
+            js_file_id,
+            source_url,
+            source_type,
+            category,
+            value,
+            context,
+            ts,
+        )
+        seen_finding_keys.add((source_type, category, value))
+        if status in ("new", "reactivated"):
+            new_findings.append(
+                {
+                    "source_url": source_url,
+                    "source_type": source_type,
+                    "category": category,
+                    "value": value,
+                    "context": context,
+                    "status": status,
+                }
+            )
+
+    skipped_deactivation = bool(result.get("failed_js_urls") or result.get("failed_page_urls"))
+    removed_findings = []
+    if not skipped_deactivation:
+        removed_findings = deactivate_missing_js_findings(cur, program_id, seen_finding_keys, ts)
+
+    critical_new = [finding for finding in new_findings if finding["category"] in JS_CRITICAL_CATEGORIES]
+
+    cur.execute(
+        """
+        INSERT INTO js_scan_history (
+            run_id, program_id, started_at, completed_at, seed_pages, direct_js_urls,
+            html_pages_scanned, js_files_found, js_files_scanned, js_files_changed,
+            findings_total, findings_new, findings_removed, critical_new, status, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            program_id,
+            result.get("started_at") or ts,
+            ts,
+            len(result.get("seed_page_urls", [])),
+            len(result.get("direct_js_urls", [])),
+            int(result.get("html_pages_scanned", 0) or 0),
+            len(result.get("discovered_js_urls", [])),
+            len(result.get("fetched_js_urls", [])),
+            len(changed_files),
+            len(result.get("findings", [])),
+            len(new_findings),
+            len(removed_findings),
+            len(critical_new),
+            result.get("status", "ok"),
+            result.get("error", ""),
+        ),
+    )
+    cur.execute(
+        """
+        UPDATE runs
+        SET js_files_found=?, js_files_changed=?, js_findings_total=?,
+            js_findings_new=?, js_findings_removed=?, js_findings_critical=?
+        WHERE id=?
+        """,
+        (
+            len(result.get("discovered_js_urls", [])),
+            len(changed_files),
+            len(result.get("findings", [])),
+            len(new_findings),
+            len(removed_findings),
+            len(critical_new),
+            run_id,
+        ),
+    )
+    conn.commit()
+
+    result["changed_files"] = changed_files
+    result["removed_js"] = removed_js
+    result["new_findings"] = new_findings
+    result["removed_findings"] = removed_findings
+    result["critical_new_findings"] = critical_new
+    result["skipped_deactivation"] = skipped_deactivation
+
+    write_jsonl(job_dir / "js_monitor_changed_files.jsonl", changed_files)
+    write_jsonl(job_dir / "js_monitor_new_findings.jsonl", new_findings)
+    write_jsonl(job_dir / "js_monitor_removed_findings.jsonl", removed_findings)
+
+    return result
+
+
+# -----------------------------
 # Telegram
 # -----------------------------
 
@@ -561,9 +1514,11 @@ def sync_targets_dir(conn: sqlite3.Connection, targets_dir: Path) -> list[sqlite
     programs: list[sqlite3.Row] = []
 
     target_files = sorted([p for p in targets_dir.iterdir() if p.is_file() and not p.name.startswith(".")])
+    active_program_names = set()
 
     for scope_file in target_files:
         program_name = scope_file.stem
+        active_program_names.add(program_name)
         roots = read_lines(scope_file)
         scope_hash = hashlib.sha256("\n".join(sorted(set(roots))).encode("utf-8")).hexdigest()
 
@@ -623,7 +1578,12 @@ def sync_targets_dir(conn: sqlite3.Connection, targets_dir: Path) -> list[sqlite
                     (str(scope_file), now, program_id),
                 )
 
-    # Keep existing programs if files disappear, but do not auto-delete them.
+    # Disable programs that no longer have a target file
+    all_db_programs = cur.execute("SELECT id, name, enabled FROM programs").fetchall()
+    for db_prog in all_db_programs:
+        if db_prog["name"] not in active_program_names and db_prog["enabled"] == 1:
+            logging.info("[%s] target file removed, disabling program", db_prog["name"])
+            cur.execute("UPDATE programs SET enabled=0, updated_at=? WHERE id=?", (now, db_prog["id"]))
     conn.commit()
 
     for row in cur.execute("SELECT * FROM programs WHERE enabled=1 ORDER BY name"):
@@ -1078,7 +2038,7 @@ def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, A
     out_file = job_dir / "asnmap.jsonl"
     cmd = [
         cfg.asnmap_bin,
-        "-l", str(domain_file),
+        "-f", str(domain_file),
         "-json",
         "-silent",
         "-o", str(out_file),
@@ -1490,6 +2450,9 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str] = N
     if cfg.katana_crawl_js:
         cmd.extend(["-jc"])
 
+    if cfg.katana_jsluice:
+        cmd.extend(["-jsluice"])
+
     if cfg.katana_headless:
         cmd.extend(["-headless"])
         
@@ -1710,6 +2673,20 @@ def format_severity_counts(findings: list[dict[str, Any]]) -> str:
     return ", ".join(parts)
 
 
+def format_js_monitor_counts(js_monitor_result: Optional[dict[str, Any]]) -> str:
+    if not js_monitor_result:
+        return "disabled"
+    status = js_monitor_result.get("status", "ok")
+    if status in ("disabled", "dry_run"):
+        return status
+    return (
+        f"{len(js_monitor_result.get('discovered_js_urls', []))} JS file(s), "
+        f"{len(js_monitor_result.get('changed_files', []))} changed/new, "
+        f"{len(js_monitor_result.get('new_findings', []))} new finding(s), "
+        f"{len(js_monitor_result.get('critical_new_findings', []))} critical"
+    )
+
+
 def group_by_subdomain(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in items:
@@ -1732,6 +2709,7 @@ def build_program_summary_report(
     port_results: list[dict[str, Any]],
     nuclei_findings: list[dict[str, Any]],
     katana_urls_count: int = 0,
+    js_monitor_result: Optional[dict[str, Any]] = None,
 ) -> str:
     httpx_by_host = {str(r.get("subdomain") or ""): r for r in httpx_results}
     ports_by_host = group_by_subdomain(port_results)
@@ -1751,6 +2729,7 @@ def build_program_summary_report(
         f"- HTTPX: {len(httpx_results)} checked, {len(live_hosts)} live",
         f"- Naabu: {len(port_results)} port/service result(s)",
         f"- Katana: {katana_urls_count} crawled URL(s)",
+        f"- JS Monitor: {format_js_monitor_counts(js_monitor_result)}",
         f"- Nuclei: {len(nuclei_findings)} finding(s) ({format_severity_counts(nuclei_findings)})",
         "",
         "**New subdomains**",
@@ -1809,6 +2788,7 @@ def notify_program_summary(
     port_results: list[dict[str, Any]],
     nuclei_findings: list[dict[str, Any]],
     katana_urls_count: int = 0,
+    js_monitor_result: Optional[dict[str, Any]] = None,
 ) -> None:
     if not cfg.notify_bin:
         return
@@ -1825,11 +2805,73 @@ def notify_program_summary(
         port_results=port_results,
         nuclei_findings=nuclei_findings,
         katana_urls_count=katana_urls_count,
+        js_monitor_result=js_monitor_result,
     )
     try:
         send_notify(cfg, report)
     except Exception as exc:
         logging.error("Notify summary send failed for %s: %s", program_name, exc)
+
+
+def notify_js_monitor_findings(cfg: Config, program_name: str, result: dict[str, Any]) -> None:
+    if not cfg.notify_step_by_step or not cfg.notify_bin:
+        return
+    if result.get("status") in ("disabled", "dry_run"):
+        return
+
+    changed_files = result.get("changed_files", [])
+    new_findings = result.get("new_findings", [])
+    critical_findings = result.get("critical_new_findings", [])
+    removed_findings = result.get("removed_findings", [])
+
+    if not changed_files and not new_findings and not removed_findings:
+        send_notify(
+            cfg,
+            f"[{program_name}] **JS monitor finished**: no JS changes or new regex findings.",
+        )
+        return
+
+    findings_to_show = new_findings
+    lines = [
+        f"[{program_name}] **JS monitor finished**",
+        "",
+        f"- JS files found: {len(result.get('discovered_js_urls', []))}",
+        f"- Changed/new JS files: {len(changed_files)}",
+        f"- New regex findings: {len(new_findings)}",
+        f"- Removed findings: {len(removed_findings)}",
+        f"- Critical new findings: {len(critical_findings)}",
+    ]
+
+    if changed_files:
+        lines.extend(["", "**Changed JS files**"])
+        for item in changed_files[:10]:
+            lines.append(f"- {md_code(item.get('status', 'changed'), 20)} {md_text(item.get('url', ''), 220)}")
+        if len(changed_files) > 10:
+            lines.append(f"*...and {len(changed_files) - 10} more*")
+
+    if findings_to_show:
+        lines.extend(["", "**New findings**"])
+        for finding in findings_to_show[:12]:
+            value = ensure_utf8_text(finding.get("value", ""))
+            if finding.get("category") in JS_CRITICAL_CATEGORIES:
+                value = mask_sensitive_value(value)
+            lines.append(
+                f"- {md_code(finding.get('category', ''), 40)} "
+                f"{md_text(value, 120)} "
+                f"({md_text(finding.get('source_url', ''), 180)})"
+            )
+        if len(findings_to_show) > 12:
+            lines.append(f"*...and {len(findings_to_show) - 12} more*")
+
+    if result.get("skipped_deactivation"):
+        lines.extend(
+            [
+                "",
+                "_Some pages or JS files failed to fetch, so finding deactivation was skipped for this cycle._",
+            ]
+        )
+
+    send_notify(cfg, "\n".join(lines).strip())
 
 
 # -----------------------------
@@ -1919,43 +2961,34 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         )
         conn.commit()
 
-        # Only short-circuit here if subfinder found nothing new AND ASN recon found no
-        # alive IPs to scan. Without the asn_alive_ips check, ASN-derived IPs would
-        # silently never reach naabu on any steady-state cycle (i.e. every cycle after
-        # the first, once subdomain enumeration has stabilized) — the ASN stage would
-        # effectively be dead code beyond the initial run.
-        if not new_hosts and not asn_alive_ips:
-            cur.execute(
-                "UPDATE runs SET finished_at=?, status='ok' WHERE id=?",
-                (utc_now(), run_id),
-            )
-            conn.commit()
-            notify_program_summary(
-                cfg,
-                program_name,
-                roots,
-                job_dir,
-                len(discovered),
-                new_hosts,
-                seen_hosts,
-                [],
-                [],
-                [],
-                [],
-                0,
-            )
-            return
-
+        # Continue into crawling/monitoring even on steady-state subdomain cycles.
+        # still lets ASN-derived IPs continue into the port scan when present.
+        # quietly monitoring JavaScript changes on known live web apps.
+        # Known live URLs are reused below as Katana seeds for monitoring.
         if new_hosts:
             (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
 
-        httpx_results, live_hosts = run_httpx(cfg, new_hosts, job_dir)
-        logging.info("[%s] Step 2 - httpx completed successfully", program_name)
-        logging.info("[%s] Saving file", program_name)
-        store_httpx(conn, program_id, httpx_results, job_dir)
-        logging.info("[%s] Saved in database", program_name)
+        httpx_results: list[dict[str, Any]] = []
+        live_hosts: list[str] = []
+        live_urls: list[str] = []
+        if new_hosts:
+            httpx_results, live_hosts = run_httpx(cfg, new_hosts, job_dir)
+            logging.info("[%s] Step 2 - httpx completed successfully", program_name)
+            logging.info("[%s] Saving file", program_name)
+            store_httpx(conn, program_id, httpx_results, job_dir)
+            logging.info("[%s] Saved in database", program_name)
+            live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
+        else:
+            logging.info("[%s] no new subdomains for httpx; reusing known live URLs for monitoring", program_name)
 
-        live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
+        known_live_urls = get_known_live_urls(conn, program_id)
+        crawl_seed_urls = filter_monitor_urls(
+            sorted(set(known_live_urls + live_urls)),
+            roots,
+            cfg.js_monitor_allow_external,
+            js_only=False,
+        )
+        (job_dir / "monitor_seed_urls.txt").write_text("\n".join(crawl_seed_urls) + "\n", encoding="utf-8")
 
         # Merge ASN-derived alive IPs into the same live_hosts list that feeds naabu.
         # This gives ASN IPs the SAME full deep port scan as subdomains via the existing
@@ -1971,7 +3004,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                 program_name, len(merged_in), len(live_hosts),
             )
 
-        if cfg.notify_step_by_step:
+        if cfg.notify_step_by_step and new_hosts:
             lines = [f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live."]
             if live_urls:
                 lines.append("\n**Live urls**")
@@ -1981,18 +3014,46 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                     lines.append(f"*...and {len(live_urls) - 15} more*")
             send_notify(cfg, "\n".join(lines).strip())
 
+        if not live_hosts and not crawl_seed_urls:
+            logging.info("[%s] no live hosts or known live URLs to scan", program_name)
+            cur.execute(
+                "UPDATE runs SET finished_at=?, status='ok' WHERE id=?",
+                (utc_now(), run_id),
+            )
+            cur.execute(
+                "UPDATE programs SET last_scanned_at=?, updated_at=? WHERE id=?",
+                (utc_now(), utc_now(), program_id),
+            )
+            conn.commit()
+            notify_program_summary(
+                cfg,
+                program_name,
+                roots,
+                job_dir,
+                len(discovered),
+                new_hosts,
+                seen_hosts,
+                httpx_results,
+                live_hosts,
+                [],
+                [],
+                0,
+                {"status": "disabled"} if not cfg.js_monitor_enabled else None,
+            )
+            return
+
         # --- Run naabu and katana in parallel ---
         port_results: list[dict[str, Any]] = []
         katana_urls: list[str] = []
 
-        if live_hosts or live_urls:
+        if live_hosts or crawl_seed_urls:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = {}
                 if live_hosts:
                     naabu_future = pool.submit(run_naabu, cfg, live_hosts, job_dir)
                     futures[naabu_future] = "naabu"
-                if live_urls:
-                    katana_future = pool.submit(run_katana, cfg, live_urls, job_dir, roots)
+                if crawl_seed_urls:
+                    katana_future = pool.submit(run_katana, cfg, crawl_seed_urls, job_dir, roots)
                     futures[katana_future] = "katana"
 
                 for future in as_completed(futures):
@@ -2053,66 +3114,91 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         else:
             logging.info("[%s] no live hosts/urls, skipping naabu and katana", program_name)
 
-        # --- Split Katana URLs and merge with live URLs for Nuclei ---
+        # --- Split Katana URLs, then run standard URL scan and JS monitor in parallel ---
         nuclei_findings: list[dict[str, Any]] = []
-        if live_urls or katana_urls:
-            httpx_url_file = job_dir / "httpx_live_urls.txt"
-            httpx_url_file.write_text("\n".join(live_urls) + "\n", encoding="utf-8")
+        js_monitor_result: Optional[dict[str, Any]] = {"status": "disabled"} if not cfg.js_monitor_enabled else None
 
-            katana_js_urls = []
-            katana_param_urls = []
-            katana_normal_urls = []
-            
-            for u in katana_urls:
-                parsed = urllib.parse.urlparse(u)
-                if parsed.path.lower().endswith('.js'):
-                    katana_js_urls.append(u)
-                elif parsed.query:
-                    katana_param_urls.append(u)
-                else:
-                    katana_normal_urls.append(u)
-                    
-            katana_js_file = job_dir / "katana_js_urls.txt"
-            katana_js_file.write_text("\n".join(katana_js_urls) + "\n", encoding="utf-8")
-            
-            katana_param_file = job_dir / "katana_param_urls.txt"
-            katana_param_file.write_text("\n".join(katana_param_urls) + "\n", encoding="utf-8")
-            
-            katana_normal_file = job_dir / "katana_normal_urls.txt"
-            katana_normal_file.write_text("\n".join(katana_normal_urls) + "\n", encoding="utf-8")
+        katana_js_urls: list[str] = []
+        katana_param_urls: list[str] = []
+        katana_normal_urls: list[str] = []
 
-            merged_url_file = job_dir / "nuclei_urls.txt"
-            merge_cmd = f"cat {httpx_url_file} {katana_param_file} | sort -u > {merged_url_file}"
-            try:
-                subprocess.run(
-                    merge_cmd, shell=True, check=True, timeout=60,
-                    capture_output=True, text=True, encoding="utf-8", errors="ignore"
-                )
-                logging.info("[%s] merged URLs via shell sort -u", program_name)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                logging.warning("[%s] shell merge failed, falling back to Python dedup: %s", program_name, exc)
-                all_urls = sorted(set(live_urls + katana_param_urls))
-                merged_url_file.write_text("\n".join(all_urls) + "\n", encoding="utf-8")
+        for url in katana_urls:
+            parsed = urllib.parse.urlparse(url)
+            if is_probable_js_url(url):
+                katana_js_urls.append(url)
+            elif parsed.query:
+                katana_param_urls.append(url)
+            else:
+                katana_normal_urls.append(url)
 
-            # Read back the deduplicated URLs
-            all_nuclei_urls = [
-                line.strip() for line in merged_url_file.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            logging.info("[%s] nuclei target urls=%d (httpx=%d + katana=%d, after dedup)",
-                         program_name, len(all_nuclei_urls), len(live_urls), len(katana_urls))
+        katana_js_urls = dedupe_strings(katana_js_urls)
+        katana_param_urls = dedupe_strings(katana_param_urls)
+        katana_normal_urls = dedupe_strings(katana_normal_urls)
 
-            if all_nuclei_urls:
-                nuclei_findings = run_nuclei(cfg, all_nuclei_urls, job_dir)
-                logging.info("[%s] Step 5 - nuclei completed successfully", program_name)
-                logging.info("[%s] Saving file", program_name)
+        (job_dir / "httpx_live_urls.txt").write_text("\n".join(crawl_seed_urls) + "\n", encoding="utf-8")
+        (job_dir / "katana_js_urls.txt").write_text("\n".join(katana_js_urls) + "\n", encoding="utf-8")
+        (job_dir / "katana_param_urls.txt").write_text("\n".join(katana_param_urls) + "\n", encoding="utf-8")
+        (job_dir / "katana_normal_urls.txt").write_text("\n".join(katana_normal_urls) + "\n", encoding="utf-8")
+
+        standard_scan_urls = dedupe_strings(crawl_seed_urls + katana_param_urls + katana_normal_urls)
+        js_page_scan_urls = dedupe_strings(crawl_seed_urls + katana_normal_urls)
+        js_direct_scan_urls = katana_js_urls
+        (job_dir / "standard_scan_urls.txt").write_text("\n".join(standard_scan_urls) + "\n", encoding="utf-8")
+
+        if standard_scan_urls or cfg.js_monitor_enabled:
+            logging.info(
+                "[%s] post-katana dual scan starting: standard_urls=%d js_direct=%d html_pages=%d",
+                program_name,
+                len(standard_scan_urls),
+                len(js_direct_scan_urls),
+                len(js_page_scan_urls),
+            )
+            raw_js_monitor_result: Optional[dict[str, Any]] = None
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {}
+                if standard_scan_urls:
+                    futures[pool.submit(run_nuclei, cfg, standard_scan_urls, job_dir)] = "nuclei"
+                if cfg.js_monitor_enabled:
+                    futures[
+                        pool.submit(
+                            run_js_monitor_scan,
+                            cfg,
+                            js_page_scan_urls,
+                            js_direct_scan_urls,
+                            roots,
+                            job_dir,
+                        )
+                    ] = "js_monitor"
+
+                for future in as_completed(futures):
+                    tool_name = futures[future]
+                    if tool_name == "nuclei":
+                        nuclei_findings = future.result()
+                        logging.info("[%s] Step 5a - standard URL scan completed successfully", program_name)
+                    elif tool_name == "js_monitor":
+                        raw_js_monitor_result = future.result()
+                        logging.info("[%s] Step 5b - JS monitor scan completed successfully", program_name)
+
+            if nuclei_findings:
+                logging.info("[%s] Saving nuclei results", program_name)
                 store_nuclei(conn, program_id, nuclei_findings)
-                logging.info("[%s] Saved in database", program_name)
-                
-                if cfg.notify_step_by_step:
-                    send_notify(cfg, f"[{program_name}] **Nuclei finished**: {len(nuclei_findings)} vulnerabilities found.")
+                logging.info("[%s] Nuclei results saved in database", program_name)
+            if cfg.notify_step_by_step and standard_scan_urls:
+                send_notify(cfg, f"[{program_name}] **Nuclei finished**: {len(nuclei_findings)} vulnerabilities found.")
+
+            if raw_js_monitor_result is not None:
+                js_monitor_result = store_js_monitor_results(conn, program_id, run_id, raw_js_monitor_result, job_dir)
+                logging.info(
+                    "[%s] JS monitor saved: files=%d changed=%d new_findings=%d removed=%d",
+                    program_name,
+                    len(js_monitor_result.get("discovered_js_urls", [])),
+                    len(js_monitor_result.get("changed_files", [])),
+                    len(js_monitor_result.get("new_findings", [])),
+                    len(js_monitor_result.get("removed_findings", [])),
+                )
+                notify_js_monitor_findings(cfg, program_name, js_monitor_result)
         else:
-            logging.info("[%s] no urls for nuclei, skipping", program_name)
+            logging.info("[%s] no post-katana URLs for standard or JS scanning", program_name)
 
         cur.execute(
             """
@@ -2141,6 +3227,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                 port_results,
                 nuclei_findings,
                 len(katana_urls),
+                js_monitor_result,
             )
 
     except Exception:
@@ -2222,7 +3309,8 @@ REQUIRED_ENV_KEYS = {
 TIMEOUT_KEYS = {
     "SUBFINDER_TIMEOUT", "HTTPX_TIMEOUT", "NAABU_TIMEOUT",
     "NUCLEI_TIMEOUT", "KATANA_TIMEOUT", "KATANA_DEPTH",
-    "MAX_JOB_RETENTION_DAYS",
+    "MAX_JOB_RETENTION_DAYS", "JS_MONITOR_THREADS", "JS_MONITOR_TIMEOUT",
+    "JS_MONITOR_RECURSION_DEPTH",
 }
 
 # Keys that are allowed to be empty or missing
@@ -2258,6 +3346,16 @@ def validate_env(env: dict[str, str], env_file: Path) -> None:
                     raise ValueError("negative")
             except ValueError:
                 invalid.append(f"  {key:25s} - must be a non-negative integer (current: '{env[key]}')")
+
+    for key in sorted(TIMEOUT_KEYS - set(REQUIRED_ENV_KEYS)):
+        if key not in env or not env[key].strip():
+            continue
+        try:
+            val = int(env[key])
+            if val < 0:
+                raise ValueError("negative")
+        except ValueError:
+            invalid.append(f"  {key:25s} - must be a non-negative integer (current: '{env[key]}')")
 
     if missing or empty or invalid:
         logging.error("=" * 65)
@@ -2296,6 +3394,12 @@ def load_config() -> Config:
 
     env = read_env_file(env_file)
     validate_env(env, env_file)
+    js_patterns_file = env.get("JS_MONITOR_PATTERNS_FILE", "").strip()
+    if js_patterns_file:
+        js_patterns_path = Path(js_patterns_file).expanduser()
+        if not js_patterns_path.is_absolute():
+            js_patterns_path = script_dir / js_patterns_path
+        js_patterns_file = str(js_patterns_path)
 
     return Config(
         root_dir=Path(env["ROOT_DIR"]).expanduser(),
@@ -2317,6 +3421,7 @@ def load_config() -> Config:
         katana_depth=int(env["KATANA_DEPTH"]),
         katana_headless=env["KATANA_HEADLESS"].strip().lower() in ("true", "1", "yes"),
         katana_crawl_js=env.get("KATANA_CRAWL_JS", "true").strip().lower() in ("true", "1", "yes"),
+        katana_jsluice=env.get("KATANA_JSLUICE", "false").strip().lower() in ("true", "1", "yes"),
         katana_field_scope=env.get("KATANA_FIELD_SCOPE", "rdn"),
         katana_custom_scope=env.get("KATANA_CUSTOM_SCOPE", ""),
         asnmap_bin=env.get("ASNMAP_BIN", "asnmap"),
@@ -2334,6 +3439,13 @@ def load_config() -> Config:
         katana_args=env.get("KATANA_ARGS", ""),
         asnmap_args=env.get("ASNMAP_ARGS", ""),
         notify_args=env.get("NOTIFY_ARGS", ""),
+        js_monitor_enabled=env.get("JS_MONITOR_ENABLED", "true").strip().lower() in ("true", "1", "yes"),
+        js_monitor_threads=int(env.get("JS_MONITOR_THREADS", "15")),
+        js_monitor_timeout=int(env.get("JS_MONITOR_TIMEOUT", "30")),
+        js_monitor_recursion_depth=int(env.get("JS_MONITOR_RECURSION_DEPTH", "3")),
+        js_monitor_deep=env.get("JS_MONITOR_DEEP", "false").strip().lower() in ("true", "1", "yes"),
+        js_monitor_patterns_file=js_patterns_file,
+        js_monitor_allow_external=env.get("JS_MONITOR_ALLOW_EXTERNAL", "false").strip().lower() in ("true", "1", "yes"),
         max_job_retention_days=int(env["MAX_JOB_RETENTION_DAYS"]),
         dry_run=env["DRY_RUN"].strip().lower() in ("true", "1", "yes"),
     )

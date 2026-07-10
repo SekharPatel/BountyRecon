@@ -18,7 +18,8 @@ Designed to be run repeatedly (via cron or systemd), this tool works completely 
   2. `httpx`: Identifies live web servers.
   3. `naabu`: Scans open ports and fingerprints services.
   4. `katana`: Crawls live URLs dynamically (Runs concurrently with Naabu).
-  5. `nuclei`: Scans the combined deduplicated URLs for vulnerabilities.
+  5. Dual post-Katana scan: `nuclei` scans standard URLs while the built-in JS monitor recursively scans Katana-discovered JavaScript and normal HTML pages.
+  6. JS monitor: hashes JavaScript files, extracts built-in/custom regex findings, and tracks future changes in SQLite.
 * **Universal Notifications (`notify`)**: Replaced hardcoded Telegram support with ProjectDiscovery's `notify`. You can now receive alerts on Discord, Slack, Telegram, Teams, or custom webhooks.
 * **Step-by-Step Alerts**: Configurable progress tracking. Receive individual alerts as each tool finishes its execution, followed by a beautifully formatted Markdown summary report.
 * **Headless Service Ready**: Fully utilizes Python's `logging` module (no standard CLI `print()` noise) making it highly optimized to run as a Linux background service.
@@ -70,9 +71,27 @@ nano .env
 | `NOTIFY_BIN` | Path to the `notify` binary. | `notify` |
 | `NOTIFY_ID` | Optional provider ID configured in your `provider-config.yaml` to route messages. | *(Blank)* |
 | `NOTIFY_STEP_BY_STEP` | If `true`, sends alerts after each tool finishes. If `false`, only sends a final summary. | `true` |
+| `JS_MONITOR_ENABLED` | Enables the built-in post-Katana JavaScript monitor. | `true` |
+| `JS_MONITOR_PATTERNS_FILE` | Optional JSON file containing `custom_patterns` regex definitions. | *(Blank)* |
+| `JS_MONITOR_RECURSION_DEPTH` | Recursive JavaScript discovery depth. | `3` |
 | `MAX_JOB_RETENTION_DAYS` | Automatically deletes tool output artifacts older than X days. | `30` |
 
 *(All tool binaries and timeouts are also configurable in the `.env` file).*
+
+Custom JS regex files use this shape:
+
+```json
+{
+  "custom_patterns": [
+    {
+      "name": "stripe_key",
+      "regex": "sk_live_[0-9a-zA-Z]{24,}",
+      "group_index": 0,
+      "ignore_case": false
+    }
+  ]
+}
+```
 
 ---
 
@@ -124,7 +143,10 @@ recon_watch_data/
             ├── httpx_hosts.txt
             ├── naabu.jsonl
             ├── katana_crawled_urls.txt
-            └── nuclei.jsonl
+            ├── nuclei.jsonl
+            ├── js_monitor_js_files.txt
+            ├── js_monitor_changed_files.jsonl
+            └── js_monitor_new_findings.jsonl
 ```
 
 ### Target Files Layout
@@ -161,6 +183,7 @@ After execution, a detailed Markdown report is fired off containing:
 * HTTPX live host validation metrics.
 * Naabu port & service result count.
 * Katana newly crawled URL count.
+* JS monitor file/change/finding counts, including critical new secret-like findings.
 * Nuclei vulnerability findings (grouped by severity).
 * Detailed blocks featuring Live Host specifics (URL, Status, Tech Stack, Ports, and Vulns).
 

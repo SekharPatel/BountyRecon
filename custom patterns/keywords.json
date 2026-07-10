@@ -1,0 +1,68 @@
+{
+  "custom_patterns": [
+    {
+      "name": "KW_AUTH",
+      "label": "Keywords - Auth",
+      "color": "cyan",
+      "regex": "(?i)(?:\\bauth\\b|\\bauthenticate\\b|\\bauthentication\\b|\\bauthorization\\b|\\bauthorize\\b|\\blogin\\b|\\blogout\\b|\\bsignin\\b|\\bsignup\\b|\\bregister\\b|\\bsession\\b|\\btoken\\b|\\baccess_token\\b|\\brefresh_token\\b|\\bjwt\\b|\\bbearer\\b|\\bapikey\\b|\\bapi_key\\b|\\bsecret\\b|\\bclient_secret\\b|\\bclient_id\\b|\\bpassword\\b|\\bpasswd\\b|\\bcredential\\b|\\boauth\\b|\\boauth2\\b|\\bopenid\\b|\\bsaml\\b|\\bldap\\b|\\bcookie\\b|\\bcsrf\\b|\\bxsrf\\b|\\bnonce\\b|\\bscope\\b|\\bpermission\\b|\\bpermissions\\b|\\brole\\b|\\broles\\b|\\badmin\\b|\\badministrator\\b|\\bsuperadmin\\b|\\broot\\b|\\bowner\\b|\\bprivilege\\b|\\bisAdmin\\b|\\bisAuthenticated\\b|\\bisDev\\b|\\bis_admin\\b|\\bsuperuser\\b|\\bbypass\\b|\\bwhitelist\\b|\\ballowlist\\b|\\boverride\\b|\\btest_user\\b|\\baccess_control\\b)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_API",
+      "label": "Keywords - Api",
+      "color": "cyan",
+      "regex": "(?i)(?:\\bapi\\b|\\bgraphql\\b|\\brest\\b|\\brpc\\b|\\bendpoint\\b|\\bbaseUrl\\b|\\bbaseURL\\b|\\borigin\\b|\\bproxy\\b|\\bgateway\\b|\\binternal\\b|\\bbackend\\b|\\bservice\\b|\\bfetch\\b|\\baxios\\b|\\brequest\\b|\\bresponse\\b|\\bwebsocket\\b|\\bws\\b|\\bwss\\b|\\bsocket\\b|\\bupload\\b|\\bdownload\\b|\\bcallback\\b|\\bredirect\\b|\\bquery\\b|\\bmutation\\b|\\bbackend_url\\b|\\binternal_api\\b|\\bintranet\\b|\\blocalhost\\b|127\\.0\\.0\\.1|\\bproxy_url\\b|\\bamqp\\b|\\bkafka\\b|\\bjsonrpc\\b|\\bsoap\\b|\\bwsdl\\b|\\bupload_file\\b|\\bfile_upload\\b|\\bdownload_path\\b|\\bredirect_uri\\b)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_CLOUD",
+      "label": "Keywords - Cloud",
+      "color": "cyan",
+      "regex": "(?i)(?:\\baws\\b|\\bamazonaws\\b|\\bs3\\b|\\bbucket\\b|\\bcloudfront\\b|\\bcloudflare\\b|\\bgcp\\b|\\bgoogleapis\\b|\\bfirebase\\b|\\bazure\\b|\\bblob\\b|\\bstorage\\b|\\bcdn\\b|\\blambda\\b|\\bkms\\b|\\bsns\\b|\\bsqs\\b|\\bec2\\b|core\\.windows\\.net|azureedge\\.net|firebaseio\\.com)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_SECRETS",
+      "label": "Keywords - Secrets",
+      "color": "cyan",
+      "regex": "(?i)(?:\\bprivate_key\\b|\\bpublic_key\\b|\\bprivate\\b|\\bpublic\\b|\\bkey\\b|\\bssh\\b|\\bpem\\b|\\brsa\\b|\\bcertificate\\b|\\bcert\\b|\\bkeystore\\b|\\bpassphrase\\b|\\baccessKey\\b|\\bsecretKey\\b|\\bclientSecret\\b|\\bencryptionKey\\b|\\bsalt\\b|\\bhash\\b|\\bsignature\\b|\\baws_access_key_id\\b|\\baws_secret_access_key\\b|\\baws_session_token\\b|\\bdatabase_url\\b|\\bdb_password\\b|\\bdb_username\\b|\\bconnection_string\\b|\\bconn_string\\b|\\bslack_webhook\\b|\\bslack_token\\b|\\bstripe_key\\b|\\bstripe_secret\\b|\\bmailgun_api\\b|\\bsendgrid_api\\b|\\btwilio_sid\\b|\\btwilio_auth\\b|\\bgithub_token\\b|\\bgitlab_token\\b|\\bheroku_api\\b|\\bokta_key\\b|\\bauth0_client\\b|\\bbraintree_key\\b|\\bsquare_secret\\b|\\balgolia_key\\b|\\bamplitude_key\\b|\\bintercom_secret\\b|\\bsecret_key\\b|\\bsession_secret\\b|\\bcookie_secret\\b|\\bmaster_key\\b|\\bprivatekey\\b|\\bid_rsa\\b|\\bdecryption_key\\b|\\bcipher_key\\b|\\bauth_token\\b|\\boauth_client\\b|\\btoken_credential\\b|\\bpassword_hash\\b|\\bmd5\\b|\\bsha256\\b|\\bhmac\\b)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_PAYMENT",
+      "label": "Keywords - Payment",
+      "color": "cyan",
+      "regex": "(?i)(?:\\bstripe\\b|\\bpaypal\\b|\\brazorpay\\b|\\bsquare\\b|\\bcheckout\\b|\\bbilling\\b|\\binvoice\\b|\\bsubscription\\b|\\bpayment\\b|\\bwallet\\b|\\bcurrency\\b|\\btax\\b|\\brefund\\b|\\bbilling_status\\b|\\bpremium\\b|\\bcheckout_url\\b|\\bpayment_gateway\\b|\\bbalance\\b|\\bcredit_card\\b|\\binvoice_id\\b)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_USER",
+      "label": "Keywords - User",
+      "color": "cyan",
+      "regex": "(?i)(?:\\buser\\b|\\busers\\b|\\baccount\\b|\\baccounts\\b|\\bprofile\\b|\\bemail\\b|\\bphone\\b|\\bmobile\\b|\\busername\\b|\\buid\\b|\\buuid\\b|\\bcustomer\\b|\\bmember\\b|\\bemployee\\b|\\bstaff\\b|\\buser_id\\b|\\baccount_id\\b|\\bsession_id\\b|\\btenant_id\\b)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_DEBUG",
+      "label": "Keywords - Debug",
+      "color": "cyan",
+      "regex": "(?i)(?:\\bdebug\\b|\\bdev\\b|\\bdevelopment\\b|\\bstaging\\b|\\btest\\b|\\btesting\\b|\\bsandbox\\b|\\bmock\\b|\\bverbose\\b|\\btrace\\b|\\blogger\\b|console\\.log|\\btodo\\b|\\bfixme\\b|\\bhack\\b|\\btemp\\b|\\bdebugging\\b|\\btestenv\\b|\\bproduction\\b|\\bconfig\\b|\\bconfiguration\\b|\\.env|\\benvironment\\b|process\\.env|\\bdebug_mode\\b|\\bfeature_flag\\b|\\bbeta_features\\b|\\btoggle\\b|\\bbackdoor\\b|\\bexploit\\b|\\bvuln\\b|\\bpayload\\b|\\bsourceMappingURL\\b|manifest\\.json)",
+      "priority": 5,
+      "group_index": 1
+    },
+    {
+      "name": "KW_ROUTES",
+      "label": "Keywords - Routes",
+      "color": "cyan",
+      "regex": "(?i)(?:/admin(?:/|\\b)|/internal(?:/|\\b)|/debug(?:/|\\b)|/config(?:/|\\b)|/api(?:/|\\b)|/graphql(?:/|\\b)|/swagger(?:/|\\b)|/openapi(?:/|\\b)|/docs(?:/|\\b)|/metrics(?:/|\\b)|/health(?:/|\\b)|/status(?:/|\\b)|/actuator(?:/|\\b)|/console(?:/|\\b)|/dashboard(?:/|\\b)|/api/v1(?:/|\\b)|/api/v2(?:/|\\b)|/api/v3(?:/|\\b)|/rest/v1(?:/|\\b)|/rest/v2(?:/|\\b))",
+      "priority": 5,
+      "group_index": 1
+    }
+  ]
+}
