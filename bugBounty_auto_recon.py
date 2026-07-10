@@ -521,8 +521,9 @@ def read_lines(path: Path) -> list[str]:
     return lines
 
 
-def run_cmd(cmd: list[str], timeout: int, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
-    logging.info("Running: %s", " ".join(cmd))
+def run_cmd(cmd: list[str], timeout: int, cwd: Optional[Path] = None, log_prefix: str = "") -> subprocess.CompletedProcess[str]:
+    prefix = f"{log_prefix} " if log_prefix else ""
+    logging.info("%sRunning: %s", prefix, " ".join(cmd))
     try:
         return subprocess.run(
             cmd,
@@ -802,11 +803,12 @@ def fetch_monitor_url(cfg: Config, url: str, js_file: bool = False) -> Optional[
         return None
 
 
-def fetch_monitor_batch(cfg: Config, urls: list[str], js_file: bool = False) -> dict[str, Optional[str]]:
+def fetch_monitor_batch(cfg: Config, urls: list[str], js_file: bool = False, max_time_seconds: int = 900) -> dict[str, Optional[str]]:
     if not urls:
         return {}
     results: dict[str, Optional[str]] = {}
     workers = max(1, min(cfg.js_monitor_threads, len(urls)))
+    start_time = time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch_monitor_url, cfg, url, js_file): url for url in urls}
         for future in as_completed(futures):
@@ -815,6 +817,12 @@ def fetch_monitor_batch(cfg: Config, urls: list[str], js_file: bool = False) -> 
                 results[url] = future.result()
             except Exception:
                 results[url] = None
+                
+            if time.time() - start_time > max_time_seconds:
+                logging.warning("JS monitor batch exceeded max time of %d seconds. Canceling remaining.", max_time_seconds)
+                for f in futures:
+                    f.cancel()
+                break
     return results
 
 
@@ -920,8 +928,21 @@ def load_js_custom_patterns(config_path: str) -> list[dict[str, Any]]:
         logging.warning("Failed to load JS custom regex config %s: %s", path, exc)
         return []
 
+    entries: list[dict[str, Any]] = []
+    if isinstance(config, dict):
+        entries = config.get("custom_patterns", [])
+    elif isinstance(config, list):
+        entries = config
+    else:
+        logging.warning(
+            "JS monitor custom regex config has unexpected top-level type: %s", type(config).__name__
+        )
+        return []
+
     patterns: list[dict[str, Any]] = []
-    for entry in config.get("custom_patterns", []):
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         name = str(entry.get("name", "")).strip()
         regex = str(entry.get("regex", "")).strip()
         if not name or not regex:
@@ -1035,10 +1056,14 @@ def extract_monitor_findings(content: str, custom_patterns: list[dict[str, Any]]
 
     for pattern in custom_patterns:
         for match in pattern["regex"].finditer(content):
-            try:
-                value = match.group(pattern["group_index"])
-            except IndexError:
-                continue
+            group_index = int(pattern.get("group_index", 0))
+            if group_index == 0:
+                value = match.group(0)
+            else:
+                try:
+                    value = match.group(group_index)
+                except IndexError:
+                    value = match.group(0)
             add(pattern["name"], value, context_slice(content, match.start()))
 
     return findings
@@ -1604,50 +1629,39 @@ def scope_roots_for_program(conn: sqlite3.Connection, program_id: int) -> list[s
 # Discovery
 # -----------------------------
 
-def run_subfinder(cfg: Config, roots: list[str], job_dir: Path) -> set[str]:
-    if not roots:
-        return set()
+def run_subfinder(cfg: Config, domains: list[str], job_dir: Path, log_prefix: str = "") -> list[str]:
+    if not domains:
+        return []
     if cfg.dry_run:
-        logging.info("[DRY_RUN] Skipping subfinder for %d roots", len(roots))
-        return set()
+        logging.info("[DRY_RUN] Skipping subfinder for %d domains", len(domains))
+        return []
 
     roots_file = job_dir / "roots.txt"
-    roots_file.write_text("\n".join(roots) + "\n", encoding="utf-8")
+    roots_file.write_text("\n".join(domains) + "\n", encoding="utf-8")
+    out_file = job_dir / "subfinder.txt"
 
     cmd = [
         cfg.subfinder_bin,
         "-dL", str(roots_file),
         "-silent",
+        "-o", str(out_file),
     ]
     if cfg.subfinder_args:
         cmd.extend(shlex.split(cfg.subfinder_args))
-        
-    proc = run_cmd(cmd, timeout=cfg.subfinder_timeout)
-    if proc.returncode != 0 and not proc.stdout.strip():
-        logging.error("subfinder failed: %s", proc.stderr.strip())
-        return set()
+    if cfg.subfinder_provider_config:
+        cmd.extend(["-pc", cfg.subfinder_provider_config])
 
-    subs: set[str] = set()
-    for line in proc.stdout.splitlines():
+    run_cmd(cmd, timeout=cfg.subfinder_timeout, log_prefix=log_prefix)
+    
+    if not out_file.exists():
+        return []
+
+    subs = set()
+    for line in out_file.read_text(encoding="utf-8").splitlines():
         s = line.strip().rstrip(".")
-        if not s:
-            continue
-        if s.startswith("{"):
-            try:
-                obj = json.loads(s)
-                host = obj.get("host") or obj.get("name") or obj.get("subdomain")
-                if host:
-                    subs.add(str(host).strip().rstrip("."))
-            except Exception:
-                continue
-        else:
+        if s:
             subs.add(s)
-            
-    if subs:
-        out_file = job_dir / "subfinder.txt"
-        out_file.write_text("\n".join(sorted(subs)) + "\n", encoding="utf-8")
-
-    return subs
+    return sorted(list(subs))
 
 
 def update_subdomains(conn: sqlite3.Connection, program_id: int, discovered: set[str]) -> tuple[list[str], list[str]]:
@@ -1685,7 +1699,7 @@ def update_subdomains(conn: sqlite3.Connection, program_id: int, discovered: set
 # httpx
 # -----------------------------
 
-def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
+def run_httpx(cfg: Config, hosts: list[str], job_dir: Path, log_prefix: str = "") -> tuple[list[dict[str, Any]], list[str]]:
     if not hosts:
         return [], []
     if cfg.dry_run:
@@ -1713,7 +1727,7 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
     if cfg.httpx_args:
         cmd.extend(shlex.split(cfg.httpx_args))
 
-    proc = run_cmd(cmd, timeout=cfg.httpx_timeout)
+    run_cmd(cmd, timeout=cfg.httpx_timeout, log_prefix=log_prefix)
 
     _seen_lines: set[str] = set()
     def iter_lines():
@@ -1721,9 +1735,6 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
             with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     yield line
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
-                yield line
 
     results: list[dict[str, Any]] = []
     live_hosts: list[str] = []
@@ -1890,32 +1901,38 @@ def store_httpx(conn: sqlite3.Connection, program_id: int, results: list[dict[st
 # naabu
 # -----------------------------
 
-def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, Any]]:
+def run_naabu(cfg: Config, hosts: list[str], job_dir: Path, alive_check: bool = False, log_prefix: str = "") -> list[dict[str, Any]]:
     if not hosts:
         return []
     if cfg.dry_run:
         logging.info("[DRY_RUN] Skipping naabu for %d hosts", len(hosts))
         return []
 
-    host_file = job_dir / "naabu_hosts.txt"
+    file_name = "asn_ips_for_alive_check.txt" if alive_check else "naabu_hosts.txt"
+    out_name = "asn_alive.jsonl" if alive_check else "naabu.jsonl"
+    
+    host_file = job_dir / file_name
     host_file.write_text("\n".join(hosts) + "\n", encoding="utf-8")
 
-    out_file = job_dir / "naabu.jsonl"
+    out_file = job_dir / out_name
     cmd = [
         cfg.naabu_bin,
         "-list", str(host_file),
+    ]
+    if alive_check:
+        cmd.extend(["-top-ports", "100"])
+    
+    cmd.extend([
         "-Pn",
         "-verify",
         "-json",
         "-silent",
         "-o", str(out_file),
-    ]
-    if cfg.naabu_nmap_cli:
-        cmd.extend(["-nmap-cli", "nmap -sV"])
+    ])
     if cfg.naabu_args:
         cmd.extend(shlex.split(cfg.naabu_args))
 
-    proc = run_cmd(cmd, timeout=cfg.naabu_timeout)
+    run_cmd(cmd, timeout=cfg.naabu_timeout, log_prefix=log_prefix)
 
     _seen_lines: set[str] = set()
     def iter_lines():
@@ -1923,9 +1940,6 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
             with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     yield line
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
-                yield line
 
     results: list[dict[str, Any]] = []
     for line in iter_lines():
@@ -2020,25 +2034,19 @@ def store_ports(conn: sqlite3.Connection, program_id: int, port_results: list[di
 # ASN -> CIDR -> IP -> alive recon
 # -----------------------------
 
-def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, Any]]:
-    """
-    Resolve ASNs for the program's scope roots and expand to CIDR ranges.
-    asnmap accepts domains directly (-d), which internally resolves org -> ASN -> CIDR.
-    Returns a list of {asn, org, cidr} dicts, deduplicated by cidr.
-    """
-    if not roots:
+def run_asnmap(cfg: Config, domains: list[str], job_dir: Path, log_prefix: str = "") -> list[dict[str, Any]]:
+    if not domains:
         return []
     if cfg.dry_run:
-        logging.info("[DRY_RUN] Skipping asnmap for %d root(s)", len(roots))
+        logging.info("[DRY_RUN] Skipping asnmap for %d domains", len(domains))
         return []
 
-    domain_file = job_dir / "asn_domains.txt"
-    domain_file.write_text("\n".join(roots) + "\n", encoding="utf-8")
-
+    dom_file = job_dir / "asn_domains.txt"
+    dom_file.write_text("\n".join(domains) + "\n", encoding="utf-8")
     out_file = job_dir / "asnmap.jsonl"
     cmd = [
         cfg.asnmap_bin,
-        "-f", str(domain_file),
+        "-f", str(dom_file),
         "-json",
         "-silent",
         "-o", str(out_file),
@@ -2046,7 +2054,7 @@ def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, A
     if cfg.asnmap_args:
         cmd.extend(shlex.split(cfg.asnmap_args))
 
-    proc = run_cmd(cmd, timeout=cfg.asn_timeout)
+    run_cmd(cmd, timeout=cfg.asn_timeout, log_prefix=log_prefix)
 
     _seen_lines: set[str] = set()
     def iter_lines():
@@ -2054,9 +2062,6 @@ def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, A
             with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     yield line
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
-                yield line
 
     ranges: dict[str, dict[str, Any]] = {}
     for line in iter_lines():
@@ -2065,13 +2070,9 @@ def run_asnmap(cfg: Config, roots: list[str], job_dir: Path) -> list[dict[str, A
             continue
         _seen_lines.add(line)
 
-        # asnmap -json emits one JSON object per CIDR (or per ASN with a range list,
-        # depending on version). Handle both shapes defensively.
         try:
             obj = json.loads(line)
         except Exception:
-            # Some asnmap versions emit plain CIDRs when -json isn't fully supported
-            # for the given query type. Treat bare CIDR-looking lines as fallback.
             if "/" in line:
                 ranges[line] = {"asn": "", "org": "", "cidr": line}
             continue
@@ -2107,77 +2108,47 @@ def store_asn_ranges(conn: sqlite3.Connection, program_id: int, ranges: list[dic
     conn.commit()
 
 
-def run_mapcidr_expand(cfg: Config, cidrs: list[str], job_dir: Path) -> list[str]:
-    """
-    Dedup/merge overlapping CIDRs, then expand to individual host IPs.
-    Two-stage mapcidr invocation matches upstream best practice: merge first
-    (collapses nested/overlapping ranges from multiple ASNs) then expand.
-    Hard-capped by cfg.asn_max_ips to avoid accidentally exploding a /8 into
-    16M hosts against a shared workdir.
-    """
+def run_mapcidr_expand(cfg: Config, cidrs: list[str], job_dir: Path, cap: int, log_prefix: str = "") -> list[str]:
     if not cidrs:
         return []
     if cfg.dry_run:
-        logging.info("[DRY_RUN] Skipping mapcidr for %d CIDR(s)", len(cidrs))
+        logging.info("[DRY_RUN] Skipping mapcidr for %d cidrs", len(cidrs))
         return []
 
     cidr_file = job_dir / "asn_cidrs.txt"
-    cidr_file.write_text("\n".join(sorted(set(cidrs))) + "\n", encoding="utf-8")
-
-    merged_file = job_dir / "asn_cidrs_merged.txt"
-    merge_cmd = [cfg.mapcidr_bin, "-cidr", str(cidr_file), "-silent"]
-    proc = run_cmd(merge_cmd, timeout=cfg.mapcidr_timeout)
-    merged_text = proc.stdout.strip()
-    if not merged_text:
-        logging.warning("mapcidr merge produced no output, falling back to raw CIDR list")
-        merged_text = "\n".join(sorted(set(cidrs)))
-    merged_file.write_text(merged_text + "\n", encoding="utf-8")
-
-    # Sanity check total host count before expansion to avoid runaway memory/disk use.
-    count_cmd = [cfg.mapcidr_bin, "-cidr", str(merged_file), "-count", "-silent"]
-    count_proc = run_cmd(count_cmd, timeout=cfg.mapcidr_timeout)
-    total_hosts = 0
-    for line in count_proc.stdout.splitlines():
+    cidr_file.write_text("\n".join(cidrs) + "\n", encoding="utf-8")
+    
+    cmd_count = [cfg.mapcidr_bin, "-cidr", str(cidr_file), "-count", "-silent"]
+    proc_count = run_cmd(cmd_count, timeout=300, log_prefix=log_prefix)
+    total_ips = 0
+    for line in proc_count.stdout.splitlines():
         line = line.strip()
         if line.isdigit():
-            total_hosts += int(line)
-        elif ":" in line:
-            # some mapcidr versions emit "<cidr>: <count>"
-            tail = line.rsplit(":", 1)[-1].strip()
-            if tail.isdigit():
-                total_hosts += int(tail)
-
-    if total_hosts > cfg.asn_max_ips:
-        logging.warning(
-            "ASN expansion would yield %d IPs, exceeding ASN_MAX_IPS=%d. "
-            "Skipping expansion for this cycle — narrow scope or raise the limit explicitly.",
-            total_hosts, cfg.asn_max_ips,
-        )
-        return []
-
-    # mapcidr with a plain -cidr flag and no -aggregate/-count/-stats writes the
-    # expanded individual host list (one IP per line) to stdout.
-    ips_proc = run_cmd(
-        [cfg.mapcidr_bin, "-cidr", str(merged_file), "-silent"],
-        timeout=cfg.mapcidr_timeout,
-    )
-
-    ips: list[str] = []
-    seen: set[str] = set()
-    for line in ips_proc.stdout.splitlines():
-        ip = line.strip()
-        if ip and ip not in seen:
-            seen.add(ip)
-            ips.append(ip)
-
-    ips_file = job_dir / "asn_ips.txt"
-    ips_file.write_text("\n".join(ips) + "\n", encoding="utf-8")
-
-    return ips
+            total_ips += int(line)
+            
+    if total_ips > cap:
+        logging.warning("mapcidr: Expansion would produce %d IPs (cap is %d). Truncating output.", total_ips, cap)
+        out_file = job_dir / "asn_ips.txt"
+        cmd_expand = [cfg.mapcidr_bin, "-cidr", str(cidr_file), "-silent", "-o", str(out_file)]
+        run_cmd(cmd_expand, timeout=600, log_prefix=log_prefix)
+        ips = []
+        try:
+            with open(out_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    ips.append(line.strip())
+                    if len(ips) >= cap:
+                        break
+        except FileNotFoundError:
+            pass
+        return ips
+        
+    cmd_expand = [cfg.mapcidr_bin, "-cidr", str(cidr_file), "-silent"]
+    proc_expand = run_cmd(cmd_expand, timeout=600, log_prefix=log_prefix)
+    ips = [ip.strip() for ip in proc_expand.stdout.splitlines() if ip.strip()]
+    return ips[:cap]
 
 
 def store_asn_ips(conn: sqlite3.Connection, program_id: int, ips: list[str]) -> None:
-    """Upserts discovered IPs. Alive/last_checked_at are set later by run_asn_alive_check."""
     if not ips:
         return
     now = utc_now()
@@ -2194,18 +2165,7 @@ def store_asn_ips(conn: sqlite3.Connection, program_id: int, ips: list[str]) -> 
     conn.commit()
 
 
-def run_asn_alive_check(cfg: Config, ips: list[str], job_dir: Path) -> list[str]:
-    """
-    Liveness sweep on ASN-derived IPs using naabu against a small common-port set.
-    Kept separate from the main run_naabu (full port scan on subdomains) because:
-      1. Different input volume profile (can be thousands of raw IPs vs known hosts)
-      2. We only need liveness here, not full port enumeration
-      3. CDN-fronted IPs are noise for ASN-based org attribution and should be
-         filtered before they ever reach the main naabu/nuclei stages
-    Alive IPs are handed back to the caller to be merged into the main pipeline's
-    live_hosts list, so they get the SAME full naabu deep scan as subdomains —
-    avoiding a duplicate/divergent scanning code path.
-    """
+def run_asn_alive_check(cfg: Config, ips: list[str], job_dir: Path, log_prefix: str = "") -> list[str]:
     if not ips:
         return []
     if cfg.dry_run:
@@ -2229,32 +2189,21 @@ def run_asn_alive_check(cfg: Config, ips: list[str], job_dir: Path) -> list[str]
     if cfg.asn_exclude_cdn:
         cmd.append("-exclude-cdn")
 
-    proc = run_cmd(cmd, timeout=cfg.asn_alive_timeout)
+    run_cmd(cmd, timeout=cfg.asn_alive_timeout, log_prefix=log_prefix)
 
     alive: list[str] = []
     seen: set[str] = set()
-
-    def iter_lines():
-        if out_file.exists():
-            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    yield line
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
-                yield line
-
-    for line in iter_lines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        ip = str(first_value(obj, ["ip", "host"], "")).strip()
-        if ip and ip not in seen:
-            seen.add(ip)
-            alive.append(ip)
+    if out_file.exists():
+        for line in out_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line: continue
+            try:
+                obj = json.loads(line)
+                ip = str(first_value(obj, ["ip", "host"], "")).strip()
+                if ip and ip not in seen:
+                    seen.add(ip)
+                    alive.append(ip)
+            except Exception: continue
 
     return alive
 
@@ -2272,39 +2221,19 @@ def mark_asn_ips_alive(conn: sqlite3.Connection, program_id: int, alive_ips: lis
 
 
 def run_asn_recon(cfg: Config, roots: list[str], job_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    """
-    Full ASN recon stage: domains -> ASN/CIDR -> merged/expanded IPs -> alive check.
-
-    IMPORTANT: this function does NOT touch the sqlite3 connection. It is designed to
-    run inside a ThreadPoolExecutor worker alongside run_subfinder, and sqlite3
-    connections created with default check_same_thread=True (see connect_db) will
-    raise ProgrammingError if used from a thread other than the one that created them.
-    All DB persistence (store_asn_ranges/store_asn_ips/mark_asn_ips_alive) must be
-    called by the caller on the main thread after this returns.
-
-    Returns (asn_ranges, expanded_ips, alive_ips). Safe to no-op via ASN_ENABLED=false.
-    Every sub-step degrades gracefully (empty list) on tool failure or dry_run, so this
-    never raises — a failed ASN lookup should never abort the rest of the recon cycle.
-    """
     if not cfg.asn_enabled:
         return [], [], []
 
-    asn_ranges = run_asnmap(cfg, roots, job_dir)
+    asn_ranges = run_asnmap(cfg, roots, job_dir, log_prefix="[ASN Pipeline]")
     if not asn_ranges:
-        logging.info("ASN recon: no ASN/CIDR data resolved for scope roots")
         return [], [], []
 
     cidrs = [r["cidr"] for r in asn_ranges]
-    ips = run_mapcidr_expand(cfg, cidrs, job_dir)
+    ips = run_mapcidr_expand(cfg, cidrs, job_dir, cap=cfg.asn_max_ips, log_prefix="[ASN Pipeline]")
     if not ips:
-        logging.info("ASN recon: no IPs expanded from %d CIDR(s)", len(cidrs))
         return asn_ranges, [], []
 
-    alive_ips = run_asn_alive_check(cfg, ips, job_dir)
-    logging.info(
-        "ASN recon: %d CIDR(s) -> %d IP(s) expanded -> %d alive",
-        len(cidrs), len(ips), len(alive_ips),
-    )
+    alive_ips = run_asn_alive_check(cfg, ips, job_dir, log_prefix="[ASN Pipeline]")
     return asn_ranges, ips, alive_ips
 
 
@@ -2312,7 +2241,7 @@ def run_asn_recon(cfg: Config, roots: list[str], job_dir: Path) -> tuple[list[di
 # nuclei
 # -----------------------------
 
-def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, Any]]:
+def run_nuclei(cfg: Config, urls: list[str], job_dir: Path, log_prefix: str = "") -> list[dict[str, Any]]:
     if not urls:
         return []
     if cfg.dry_run:
@@ -2335,7 +2264,7 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
     if cfg.nuclei_args:
         cmd.extend(shlex.split(cfg.nuclei_args))
 
-    proc = run_cmd(cmd, timeout=cfg.nuclei_timeout)
+    run_cmd(cmd, timeout=cfg.nuclei_timeout, log_prefix=log_prefix)
 
     _seen_lines: set[str] = set()
     def iter_lines():
@@ -2343,9 +2272,6 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
             with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     yield line
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
-                yield line
 
     findings: list[dict[str, Any]] = []
     for line in iter_lines():
@@ -2419,8 +2345,7 @@ def store_nuclei(conn: sqlite3.Connection, program_id: int, findings: list[dict[
 # katana
 # -----------------------------
 
-def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str] = None) -> list[str]:
-    """Crawl live URLs with katana and return discovered endpoint URLs."""
+def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str], log_prefix: str = "") -> list[str]:
     if not urls:
         return []
     if cfg.dry_run:
@@ -2459,7 +2384,7 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str] = N
     if cfg.katana_args:
         cmd.extend(shlex.split(cfg.katana_args))
 
-    proc = run_cmd(cmd, timeout=cfg.katana_timeout)
+    proc = run_cmd(cmd, timeout=cfg.katana_timeout, log_prefix=log_prefix)
 
     _seen_lines: set[str] = set()
     def iter_lines():
@@ -2882,62 +2807,58 @@ def program_workdir(base: Path, program_name: str) -> Path:
     return ensure_dir(base / safe_name(program_name))
 
 
-def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Row) -> None:
+def get_known_katana_urls(conn: sqlite3.Connection, program_id: int) -> set[str]:
+    """Retrieve all previously stored Katana URLs for the given program."""
     cur = conn.cursor()
-    program_id = int(program["id"])
-    program_name = str(program["name"])
-    job_dir = ensure_dir(program_workdir(cfg.workdir, program_name) / dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    known = set()
+    for row in cur.execute("SELECT urls FROM katana_results WHERE program_id=?", (program_id,)):
+        try:
+            urls = json.loads(row["urls"])
+            for u in urls:
+                known.add(u)
+        except Exception:
+            pass
+    return known
 
-    roots = scope_roots_for_program(conn, program_id)
-    if not roots:
-        logging.info("[%s] no scope roots found, skipping", program_name)
-        return
 
-    cur.execute(
-        "INSERT INTO runs (program_id, started_at) VALUES (?, ?)",
-        (program_id, utc_now()),
-    )
-    run_id = cur.lastrowid
-    conn.commit()
+def _run_web_pipeline(
+    cfg: Config,
+    db_path: Path,
+    program_id: int,
+    program_name: str,
+    roots: list[str],
+    job_dir: Path,
+    run_id: int,
+) -> dict[str, Any]:
+    """
+    Web pipeline: subfinder → httpx → katana → 3-way parallel (nuclei, js_monitor).
+    Runs in its own thread with its own DB connection so it never blocks the ASN pipeline.
+    """
+    conn = connect_db(db_path)
+    cur = conn.cursor()
+    result: dict[str, Any] = {
+        "discovered": set(),
+        "new_hosts": [],
+        "seen_hosts": [],
+        "httpx_results": [],
+        "live_hosts": [],
+        "katana_urls": [],
+        "nuclei_findings": [],
+        "js_monitor_result": {"status": "disabled"} if not cfg.js_monitor_enabled else None,
+    }
 
     try:
-        # ASN recon is independent of subdomain enumeration (it queries ASN/BGP data
-        # keyed on the root domains/org, not on discovered hosts) and is run in
-        # parallel with subfinder. Deliberately placed BEFORE the `if not new_hosts`
-        # early-return below — ASN-derived IPs must still get scanned on steady-state
-        # cycles where subfinder finds nothing new, otherwise this stage would
-        # effectively only ever fire on the very first run.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            subfinder_future = pool.submit(run_subfinder, cfg, roots, job_dir)
-            asn_future = pool.submit(run_asn_recon, cfg, roots, job_dir)
-
-            discovered = subfinder_future.result()
-            logging.info("[%s] Step 1 - subfinder completed successfully", program_name)
-
-            asn_ranges, asn_ips, asn_alive_ips = asn_future.result()
-
-        # All sqlite3 writes happen here on the main thread — see run_asn_recon docstring.
-        if cfg.asn_enabled:
-            store_asn_ranges(conn, program_id, asn_ranges)
-            store_asn_ips(conn, program_id, asn_ips)
-            mark_asn_ips_alive(conn, program_id, asn_alive_ips)
-            logging.info(
-                "[%s] Step 1b - ASN recon completed: %d range(s), %d IP(s) expanded, %d alive",
-                program_name, len(asn_ranges), len(asn_ips), len(asn_alive_ips),
-            )
-            if cfg.notify_step_by_step and asn_ranges:
-                lines = [f"[{program_name}] **ASN recon finished**: {len(asn_ranges)} range(s), {len(asn_alive_ips)} alive IP(s)"]
-                if asn_alive_ips:
-                    lines.append("\n**Alive IPs**")
-                    for ip in asn_alive_ips[:15]:
-                        lines.append(f"- {ip}")
-                    if len(asn_alive_ips) > 15:
-                        lines.append(f"*...and {len(asn_alive_ips) - 15} more*")
-                send_notify(cfg, "\n".join(lines).strip())
+        # ── Step 1: Subfinder ────────────────────────────────────────────
+        discovered = run_subfinder(cfg, roots, job_dir)
+        logging.info("[%s] Web Pipeline – subfinder completed", program_name)
+        result["discovered"] = discovered
 
         new_hosts, seen_hosts = update_subdomains(conn, program_id, discovered)
-        total_db_hosts = cur.execute("SELECT COUNT(*) FROM subdomains WHERE program_id=?", (program_id,)).fetchone()[0]
-        logging.info("[%s] Output saved successfully in file and database.", program_name)
+        result["new_hosts"] = new_hosts
+        result["seen_hosts"] = seen_hosts
+        total_db_hosts = cur.execute(
+            "SELECT COUNT(*) FROM subdomains WHERE program_id=?", (program_id,)
+        ).fetchone()[0]
 
         if cfg.notify_step_by_step:
             if len(new_hosts) > 0:
@@ -2961,25 +2882,30 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         )
         conn.commit()
 
-        # Continue into crawling/monitoring even on steady-state subdomain cycles.
-        # still lets ASN-derived IPs continue into the port scan when present.
-        # quietly monitoring JavaScript changes on known live web apps.
-        # Known live URLs are reused below as Katana seeds for monitoring.
         if new_hosts:
-            (job_dir / "new_subdomains.txt").write_text("\n".join(new_hosts) + "\n", encoding="utf-8")
+            (job_dir / "new_subdomains.txt").write_text(
+                "\n".join(new_hosts) + "\n", encoding="utf-8"
+            )
 
+        # ── Step 2: HTTPX ────────────────────────────────────────────────
         httpx_results: list[dict[str, Any]] = []
         live_hosts: list[str] = []
         live_urls: list[str] = []
         if new_hosts:
             httpx_results, live_hosts = run_httpx(cfg, new_hosts, job_dir)
-            logging.info("[%s] Step 2 - httpx completed successfully", program_name)
-            logging.info("[%s] Saving file", program_name)
+            logging.info("[%s] Web Pipeline – httpx completed", program_name)
             store_httpx(conn, program_id, httpx_results, job_dir)
-            logging.info("[%s] Saved in database", program_name)
-            live_urls = sorted(set([r["url"] for r in httpx_results if r.get("alive") and r.get("url")]))
+            live_urls = sorted(
+                set(r["url"] for r in httpx_results if r.get("alive") and r.get("url"))
+            )
         else:
-            logging.info("[%s] no new subdomains for httpx; reusing known live URLs for monitoring", program_name)
+            logging.info(
+                "[%s] Web Pipeline – no new subdomains for httpx; reusing known live URLs",
+                program_name,
+            )
+
+        result["httpx_results"] = httpx_results
+        result["live_hosts"] = live_hosts
 
         known_live_urls = get_known_live_urls(conn, program_id)
         crawl_seed_urls = filter_monitor_urls(
@@ -2988,24 +2914,15 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
             cfg.js_monitor_allow_external,
             js_only=False,
         )
-        (job_dir / "monitor_seed_urls.txt").write_text("\n".join(crawl_seed_urls) + "\n", encoding="utf-8")
-
-        # Merge ASN-derived alive IPs into the same live_hosts list that feeds naabu.
-        # This gives ASN IPs the SAME full deep port scan as subdomains via the existing
-        # run_naabu call below, rather than a separate/divergent scanning code path.
-        # These IPs have no corresponding httpx/live_urls entry (no hostname to probe),
-        # so they only flow through the naabu port-scan side, not katana/nuclei.
-        if asn_alive_ips:
-            existing = set(live_hosts)
-            merged_in = [ip for ip in asn_alive_ips if ip not in existing]
-            live_hosts = live_hosts + merged_in
-            logging.info(
-                "[%s] merged %d ASN-derived alive IP(s) into naabu target list (%d total live hosts)",
-                program_name, len(merged_in), len(live_hosts),
-            )
+        (job_dir / "monitor_seed_urls.txt").write_text(
+            "\n".join(crawl_seed_urls) + "\n", encoding="utf-8"
+        )
 
         if cfg.notify_step_by_step and new_hosts:
-            lines = [f"[{program_name}] **HTTPX finished**: {len(live_hosts)} out of {len(new_hosts)} are live."]
+            lines = [
+                f"[{program_name}] **HTTPX finished**: "
+                f"{len(live_hosts)} out of {len(new_hosts)} are live."
+            ]
             if live_urls:
                 lines.append("\n**Live urls**")
                 for u in live_urls[:15]:
@@ -3014,110 +2931,83 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                     lines.append(f"*...and {len(live_urls) - 15} more*")
             send_notify(cfg, "\n".join(lines).strip())
 
-        if not live_hosts and not crawl_seed_urls:
-            logging.info("[%s] no live hosts or known live URLs to scan", program_name)
-            cur.execute(
-                "UPDATE runs SET finished_at=?, status='ok' WHERE id=?",
-                (utc_now(), run_id),
-            )
-            cur.execute(
-                "UPDATE programs SET last_scanned_at=?, updated_at=? WHERE id=?",
-                (utc_now(), utc_now(), program_id),
-            )
-            conn.commit()
-            notify_program_summary(
-                cfg,
-                program_name,
-                roots,
-                job_dir,
-                len(discovered),
-                new_hosts,
-                seen_hosts,
-                httpx_results,
-                live_hosts,
-                [],
-                [],
-                0,
-                {"status": "disabled"} if not cfg.js_monitor_enabled else None,
-            )
-            return
+        if not crawl_seed_urls:
+            logging.info("[%s] Web Pipeline – no URLs to crawl/scan, finishing", program_name)
+            return result
 
-        # --- Run naabu and katana in parallel ---
-        port_results: list[dict[str, Any]] = []
-        katana_urls: list[str] = []
+        # ── Step 3: Parallel Katana and Naabu (Web Pipeline) ────────────
+        known_katana_urls = get_known_katana_urls(conn, program_id)
+        katana_urls = []
+        web_port_results = []
+        
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {}
+            if live_hosts:
+                futures[pool.submit(run_naabu, cfg, live_hosts, job_dir)] = "naabu"
+            
+            futures[pool.submit(run_katana, cfg, crawl_seed_urls, job_dir, roots)] = "katana"
 
-        if live_hosts or crawl_seed_urls:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = {}
-                if live_hosts:
-                    naabu_future = pool.submit(run_naabu, cfg, live_hosts, job_dir)
-                    futures[naabu_future] = "naabu"
-                if crawl_seed_urls:
-                    katana_future = pool.submit(run_katana, cfg, crawl_seed_urls, job_dir, roots)
-                    futures[katana_future] = "katana"
-
-                for future in as_completed(futures):
-                    tool_name = futures[future]
-                    if tool_name == "naabu":
-                        port_results = future.result()
-                        logging.info("[%s] Step 3 - naabu completed successfully", program_name)
-                        logging.info("[%s] Saving file", program_name)
-                        store_ports(conn, program_id, port_results)
-                        logging.info("[%s] Saved in database", program_name)
-                        
-                        if cfg.notify_step_by_step:
-                            unique_ports = {}
-                            for p in port_results:
-                                host = p.get("host")
-                                port = p.get("port")
-                                if not host or not port: continue
-                                key = (host, port)
-                                if key not in unique_ports:
+            for future in as_completed(futures):
+                tool_name = futures[future]
+                if tool_name == "naabu":
+                    web_port_results = future.result()
+                    logging.info("[%s] Web Pipeline – naabu completed: %d finding(s)", program_name, len(web_port_results))
+                    store_ports(conn, program_id, web_port_results)
+                    
+                    if cfg.notify_step_by_step:
+                        unique_ports = {}
+                        for p in web_port_results:
+                            host = p.get("host")
+                            port = p.get("port")
+                            if not host or not port:
+                                continue
+                            key = (host, port)
+                            if key not in unique_ports:
+                                unique_ports[key] = p
+                            else:
+                                if not unique_ports[key].get("version") and p.get("version"):
                                     unique_ports[key] = p
-                                else:
-                                    if not unique_ports[key].get("version") and p.get("version"):
-                                        unique_ports[key] = p
+                        
+                        host_port_map: dict[str, list[dict]] = {}
+                        for p in unique_ports.values():
+                            host_port_map.setdefault(p["host"], []).append(p)
                             
-                            host_port_map: dict[str, list[dict]] = {}
-                            for p in unique_ports.values():
-                                host_port_map.setdefault(p["host"], []).append(p)
+                        lines = [f"[{program_name}] **Web Naabu finished**: {len(unique_ports)} unique port findings\n"]
+                        for host, ports in list(host_port_map.items())[:10]:
+                            lines.append(f"**{host}**")
+                            ports.sort(key=lambda x: int(x.get("port", 0)) if str(x.get("port", "0")).isdigit() else 0)
+                            for p in ports:
+                                port = p.get("port")
+                                proto = p.get("protocol") or "tcp"
+                                svc = p.get("service") or ""
+                                prod = p.get("version") or ""
+                                details = ": ".join(filter(None, [svc, prod]))
+                                svc_str = f" ({details})" if details else ""
+                                lines.append(f"- {port}/{proto}{svc_str}")
+                            lines.append("")
+                        
+                        if len(host_port_map) > 10:
+                            lines.append(f"*...and {len(host_port_map) - 10} more hosts*")
                             
-                            lines = [f"[{program_name}] **Naabu finished**: {len(unique_ports)} unique port findings\n"]
-                            for host, ports in list(host_port_map.items())[:10]:
-                                lines.append(f"**{host}**")
-                                ports.sort(key=lambda x: int(x.get("port", 0)) if str(x.get("port", "0")).isdigit() else 0)
-                                for p in ports:
-                                    port = p.get("port")
-                                    proto = p.get("protocol") or "tcp"
-                                    svc = p.get("service") or ""
-                                    prod = p.get("version") or ""
-                                    details = ": ".join(filter(None, [svc, prod]))
-                                    svc_str = f" ({details})" if details else ""
-                                    lines.append(f"- {port}/{proto}{svc_str}")
-                                lines.append("")
-                            
-                            if len(host_port_map) > 10:
-                                lines.append(f"*...and {len(host_port_map) - 10} more hosts*")
-                            
+                        if unique_ports:
                             send_notify(cfg, "\n".join(lines).strip())
 
-                    elif tool_name == "katana":
-                        katana_urls = future.result()
-                        logging.info("[%s] Step 4 - katana completed successfully", program_name)
-                        logging.info("[%s] Saving file", program_name)
-                        katana_parsed = parse_katana_results(job_dir, roots)
-                        store_katana(conn, program_id, katana_parsed)
-                        logging.info("[%s] Saved in database", program_name)
-                        
-                        if cfg.notify_step_by_step:
-                            send_notify(cfg, f"[{program_name}] **Katana finished**: {len(katana_urls)} new URLs crawled.")
-        else:
-            logging.info("[%s] no live hosts/urls, skipping naabu and katana", program_name)
+                elif tool_name == "katana":
+                    katana_urls = future.result()
+                    logging.info("[%s] Web Pipeline – katana completed", program_name)
+                    katana_parsed = parse_katana_results(job_dir, roots)
+                    store_katana(conn, program_id, katana_parsed)
+                    
+                    if cfg.notify_step_by_step:
+                        send_notify(
+                            cfg,
+                            f"[{program_name}] **Katana finished**: {len(katana_urls)} new URLs crawled.",
+                        )
 
-        # --- Split Katana URLs, then run standard URL scan and JS monitor in parallel ---
-        nuclei_findings: list[dict[str, Any]] = []
-        js_monitor_result: Optional[dict[str, Any]] = {"status": "disabled"} if not cfg.js_monitor_enabled else None
+        result["katana_urls"] = katana_urls
+        result["web_port_results"] = web_port_results
 
+        # ── Split katana URLs into three categories ──────────────────────
         katana_js_urls: list[str] = []
         katana_param_urls: list[str] = []
         katana_normal_urls: list[str] = []
@@ -3135,29 +3025,52 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         katana_param_urls = dedupe_strings(katana_param_urls)
         katana_normal_urls = dedupe_strings(katana_normal_urls)
 
-        (job_dir / "httpx_live_urls.txt").write_text("\n".join(crawl_seed_urls) + "\n", encoding="utf-8")
-        (job_dir / "katana_js_urls.txt").write_text("\n".join(katana_js_urls) + "\n", encoding="utf-8")
-        (job_dir / "katana_param_urls.txt").write_text("\n".join(katana_param_urls) + "\n", encoding="utf-8")
-        (job_dir / "katana_normal_urls.txt").write_text("\n".join(katana_normal_urls) + "\n", encoding="utf-8")
+        (job_dir / "httpx_live_urls.txt").write_text(
+            "\n".join(crawl_seed_urls) + "\n", encoding="utf-8"
+        )
+        (job_dir / "katana_js_urls.txt").write_text(
+            "\n".join(katana_js_urls) + "\n", encoding="utf-8"
+        )
+        (job_dir / "katana_param_urls.txt").write_text(
+            "\n".join(katana_param_urls) + "\n", encoding="utf-8"
+        )
+        (job_dir / "katana_normal_urls.txt").write_text(
+            "\n".join(katana_normal_urls) + "\n", encoding="utf-8"
+        )
 
-        standard_scan_urls = dedupe_strings(crawl_seed_urls + katana_param_urls + katana_normal_urls)
+        new_param_urls = [u for u in katana_param_urls if u not in known_katana_urls]
+
+        # Nuclei receives only NEW parameter-bearing URLs
+        nuclei_scan_urls = dedupe_strings(new_param_urls)
+        # JS monitor receives normal pages as HTML seeds, JS files as direct targets
         js_page_scan_urls = dedupe_strings(crawl_seed_urls + katana_normal_urls)
         js_direct_scan_urls = katana_js_urls
-        (job_dir / "standard_scan_urls.txt").write_text("\n".join(standard_scan_urls) + "\n", encoding="utf-8")
+        (job_dir / "nuclei_scan_urls.txt").write_text(
+            "\n".join(nuclei_scan_urls) + "\n", encoding="utf-8"
+        )
 
-        if standard_scan_urls or cfg.js_monitor_enabled:
+        # ── Step 4: 3-way parallel (nuclei + js_html + js_js) ───────────
+        nuclei_findings: list[dict[str, Any]] = []
+        js_monitor_result: Optional[dict[str, Any]] = (
+            {"status": "disabled"} if not cfg.js_monitor_enabled else None
+        )
+
+        if not nuclei_scan_urls:
+            logging.info("[%s] Web Pipeline – No new parameter URLs found, skipping Nuclei", program_name)
+
+        if nuclei_scan_urls or cfg.js_monitor_enabled:
             logging.info(
-                "[%s] post-katana dual scan starting: standard_urls=%d js_direct=%d html_pages=%d",
+                "[%s] Web Pipeline – post-katana parallel: nuclei=%d js_pages=%d js_direct=%d",
                 program_name,
-                len(standard_scan_urls),
-                len(js_direct_scan_urls),
+                len(nuclei_scan_urls),
                 len(js_page_scan_urls),
+                len(js_direct_scan_urls),
             )
             raw_js_monitor_result: Optional[dict[str, Any]] = None
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = {}
-                if standard_scan_urls:
-                    futures[pool.submit(run_nuclei, cfg, standard_scan_urls, job_dir)] = "nuclei"
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures: dict[Any, str] = {}
+                if nuclei_scan_urls:
+                    futures[pool.submit(run_nuclei, cfg, nuclei_scan_urls, job_dir)] = "nuclei"
                 if cfg.js_monitor_enabled:
                     futures[
                         pool.submit(
@@ -3174,22 +3087,25 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                     tool_name = futures[future]
                     if tool_name == "nuclei":
                         nuclei_findings = future.result()
-                        logging.info("[%s] Step 5a - standard URL scan completed successfully", program_name)
+                        logging.info("[%s] Web Pipeline – nuclei completed", program_name)
                     elif tool_name == "js_monitor":
                         raw_js_monitor_result = future.result()
-                        logging.info("[%s] Step 5b - JS monitor scan completed successfully", program_name)
+                        logging.info("[%s] Web Pipeline – JS monitor completed", program_name)
 
             if nuclei_findings:
-                logging.info("[%s] Saving nuclei results", program_name)
                 store_nuclei(conn, program_id, nuclei_findings)
-                logging.info("[%s] Nuclei results saved in database", program_name)
-            if cfg.notify_step_by_step and standard_scan_urls:
-                send_notify(cfg, f"[{program_name}] **Nuclei finished**: {len(nuclei_findings)} vulnerabilities found.")
+            if cfg.notify_step_by_step and nuclei_scan_urls:
+                send_notify(
+                    cfg,
+                    f"[{program_name}] **Nuclei finished**: {len(nuclei_findings)} vulnerabilities found.",
+                )
 
             if raw_js_monitor_result is not None:
-                js_monitor_result = store_js_monitor_results(conn, program_id, run_id, raw_js_monitor_result, job_dir)
+                js_monitor_result = store_js_monitor_results(
+                    conn, program_id, run_id, raw_js_monitor_result, job_dir
+                )
                 logging.info(
-                    "[%s] JS monitor saved: files=%d changed=%d new_findings=%d removed=%d",
+                    "[%s] Web Pipeline – JS monitor saved: files=%d changed=%d new=%d removed=%d",
                     program_name,
                     len(js_monitor_result.get("discovered_js_urls", [])),
                     len(js_monitor_result.get("changed_files", [])),
@@ -3198,7 +3114,202 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                 )
                 notify_js_monitor_findings(cfg, program_name, js_monitor_result)
         else:
-            logging.info("[%s] no post-katana URLs for standard or JS scanning", program_name)
+            logging.info("[%s] Web Pipeline – no post-katana URLs for scanning", program_name)
+
+        result["nuclei_findings"] = nuclei_findings
+        result["js_monitor_result"] = js_monitor_result
+
+    finally:
+        conn.close()
+
+    return result
+
+
+def _run_asn_pipeline(
+    cfg: Config,
+    db_path: Path,
+    program_id: int,
+    program_name: str,
+    roots: list[str],
+    job_dir: Path,
+) -> dict[str, Any]:
+    """
+    ASN pipeline: asnmap → mapcidr → naabu port scan.
+    Runs in its own thread with its own DB connection so it never blocks the web pipeline.
+    The existing ASN_MAX_IPS cap in mapcidr expansion limits total IPs sent to naabu.
+    """
+    conn = connect_db(db_path)
+    result: dict[str, Any] = {
+        "asn_ranges": [],
+        "asn_ips": [],
+        "asn_alive_ips": [],
+        "port_results": [],
+    }
+
+    try:
+        if not cfg.asn_enabled:
+            logging.info("[%s] ASN Pipeline – disabled via ASN_ENABLED=false", program_name)
+            return result
+
+        # ── Step 1: ASN recon (asnmap → mapcidr → alive check) ───────────
+        asn_ranges, asn_ips, asn_alive_ips = run_asn_recon(cfg, roots, job_dir)
+        result["asn_ranges"] = asn_ranges
+        result["asn_ips"] = asn_ips
+        result["asn_alive_ips"] = asn_alive_ips
+
+        store_asn_ranges(conn, program_id, asn_ranges)
+        store_asn_ips(conn, program_id, asn_ips)
+        mark_asn_ips_alive(conn, program_id, asn_alive_ips)
+        logging.info(
+            "[%s] ASN Pipeline – recon completed: %d range(s), %d IP(s) expanded, %d alive",
+            program_name,
+            len(asn_ranges),
+            len(asn_ips),
+            len(asn_alive_ips),
+        )
+
+        if cfg.notify_step_by_step and asn_ranges:
+            lines = [
+                f"[{program_name}] **ASN recon finished**: "
+                f"{len(asn_ranges)} range(s), {len(asn_alive_ips)} alive IP(s)"
+            ]
+            if asn_alive_ips:
+                lines.append("\n**Alive IPs**")
+                for ip in asn_alive_ips[:15]:
+                    lines.append(f"- {ip}")
+                if len(asn_alive_ips) > 15:
+                    lines.append(f"*...and {len(asn_alive_ips) - 15} more*")
+            send_notify(cfg, "\n".join(lines).strip())
+
+        # ── Step 2: Naabu port scan on alive ASN IPs ─────────────────────
+        if not asn_alive_ips:
+            logging.info("[%s] ASN Pipeline – no alive IPs, skipping naabu", program_name)
+            return result
+
+        port_results = run_naabu(cfg, asn_alive_ips, job_dir)
+        result["port_results"] = port_results
+        logging.info(
+            "[%s] ASN Pipeline – naabu completed: %d port finding(s)",
+            program_name,
+            len(port_results),
+        )
+        store_ports(conn, program_id, port_results)
+
+        if cfg.notify_step_by_step:
+            unique_ports: dict[tuple, dict] = {}
+            for p in port_results:
+                host = p.get("host")
+                port = p.get("port")
+                if not host or not port:
+                    continue
+                key = (host, port)
+                if key not in unique_ports:
+                    unique_ports[key] = p
+                else:
+                    if not unique_ports[key].get("version") and p.get("version"):
+                        unique_ports[key] = p
+
+            host_port_map: dict[str, list[dict]] = {}
+            for p in unique_ports.values():
+                host_port_map.setdefault(p["host"], []).append(p)
+
+            lines = [
+                f"[{program_name}] **ASN Naabu finished**: "
+                f"{len(unique_ports)} unique port findings\n"
+            ]
+            for host, ports in list(host_port_map.items())[:10]:
+                lines.append(f"**{host}**")
+                ports.sort(
+                    key=lambda x: int(x.get("port", 0))
+                    if str(x.get("port", "0")).isdigit()
+                    else 0
+                )
+                for p in ports:
+                    port = p.get("port")
+                    proto = p.get("protocol") or "tcp"
+                    svc = p.get("service") or ""
+                    prod = p.get("version") or ""
+                    details = ": ".join(filter(None, [svc, prod]))
+                    svc_str = f" ({details})" if details else ""
+                    lines.append(f"- {port}/{proto}{svc_str}")
+                lines.append("")
+
+            if len(host_port_map) > 10:
+                lines.append(f"*...and {len(host_port_map) - 10} more hosts*")
+
+            send_notify(cfg, "\n".join(lines).strip())
+
+    finally:
+        conn.close()
+
+    return result
+
+
+def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Row) -> None:
+    """
+    Orchestrator: launches the web pipeline and ASN pipeline as two fully independent
+    threads, waits for both, then merges results for the final summary and DB update.
+    """
+    cur = conn.cursor()
+    program_id = int(program["id"])
+    program_name = str(program["name"])
+    job_dir = ensure_dir(
+        program_workdir(cfg.workdir, program_name)
+        / dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    )
+
+    roots = scope_roots_for_program(conn, program_id)
+    if not roots:
+        logging.info("[%s] no scope roots found, skipping", program_name)
+        return
+
+    cur.execute(
+        "INSERT INTO runs (program_id, started_at) VALUES (?, ?)",
+        (program_id, utc_now()),
+    )
+    run_id = cur.lastrowid
+    conn.commit()
+
+    try:
+        web_result: dict[str, Any] = {}
+        asn_result: dict[str, Any] = {}
+
+        # Launch both pipelines in fully independent threads
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            web_future = pool.submit(
+                _run_web_pipeline,
+                cfg, cfg.db_path, program_id, program_name, roots, job_dir, run_id,
+            )
+            asn_future = pool.submit(
+                _run_asn_pipeline,
+                cfg, cfg.db_path, program_id, program_name, roots, job_dir,
+            )
+
+            for future in as_completed({web_future: "web", asn_future: "asn"}):
+                label = {web_future: "web", asn_future: "asn"}[future]
+                try:
+                    if label == "web":
+                        web_result = future.result()
+                        logging.info("[%s] [DONE] Web pipeline finished", program_name)
+                    else:
+                        asn_result = future.result()
+                        logging.info("[%s] [DONE] ASN pipeline finished", program_name)
+                except Exception:
+                    logging.exception("[%s] %s pipeline failed", program_name, label)
+
+        # ── Merge results and update the runs table ──────────────────────
+        discovered = web_result.get("discovered", set())
+        new_hosts = web_result.get("new_hosts", [])
+        seen_hosts = web_result.get("seen_hosts", [])
+        httpx_results = web_result.get("httpx_results", [])
+        live_hosts = web_result.get("live_hosts", [])
+        katana_urls = web_result.get("katana_urls", [])
+        nuclei_findings = web_result.get("nuclei_findings", [])
+        js_monitor_result = web_result.get("js_monitor_result")
+        
+        web_port_results = web_result.get("web_port_results", [])
+        asn_port_results = asn_result.get("port_results", [])
+        port_results = web_port_results + asn_port_results
 
         cur.execute(
             """
@@ -3215,20 +3326,20 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         conn.commit()
 
         notify_program_summary(
-                cfg,
-                program_name,
-                roots,
-                job_dir,
-                len(discovered),
-                new_hosts,
-                seen_hosts,
-                httpx_results,
-                live_hosts,
-                port_results,
-                nuclei_findings,
-                len(katana_urls),
-                js_monitor_result,
-            )
+            cfg,
+            program_name,
+            roots,
+            job_dir,
+            len(discovered),
+            new_hosts,
+            seen_hosts,
+            httpx_results,
+            live_hosts,
+            port_results,
+            nuclei_findings,
+            len(katana_urls),
+            js_monitor_result,
+        )
 
     except Exception:
         cur.execute(
@@ -3598,7 +3709,10 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nScan interrupted by user (Ctrl+C). Exiting gracefully...")
         logging.info("Scan interrupted by user (KeyboardInterrupt).")
-        return 130
+        if 'lock_file' in locals() and lock_file:
+            lock_file.close()
+        import os
+        os._exit(1)
     except subprocess.TimeoutExpired as exc:
         logging.exception("Timeout: %s", exc)
         return 1
