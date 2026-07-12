@@ -151,6 +151,7 @@ class Config:
     asn_alive_timeout: int = 1800
     asn_max_ips: int = 65536
     asn_exclude_cdn: bool = True
+    subfinder_provider_config: str = ""
     subfinder_args: str = ""
     httpx_args: str = ""
     naabu_args: str = ""
@@ -1128,6 +1129,7 @@ def run_js_monitor_scan(
     js_sources: dict[str, str] = {url: "katana" for url in direct_js}
 
     if seed_pages:
+        logging.info("JS Monitor: Fetching %d seed HTML pages...", len(seed_pages))
         page_bodies = fetch_monitor_batch(cfg, seed_pages, js_file=False)
         for page_url, body in page_bodies.items():
             if not body:
@@ -1156,6 +1158,7 @@ def run_js_monitor_scan(
             sitemap_pages.extend(fetch_sitemap_routes(cfg, origin, roots)[:20])
         sitemap_pages = [url for url in dedupe_strings(sitemap_pages) if url not in set(seed_pages)]
         if sitemap_pages:
+            logging.info("JS Monitor: Fetching %d deep HTML sitemap pages...", len(sitemap_pages))
             page_bodies = fetch_monitor_batch(cfg, sitemap_pages, js_file=False)
             for page_url, body in page_bodies.items():
                 if not body:
@@ -1179,6 +1182,7 @@ def run_js_monitor_scan(
         to_fetch = sorted(discovered_js - attempted_js)
         if not to_fetch:
             break
+        logging.info("JS Monitor: Fetching %d JS files at depth %d...", len(to_fetch), _depth + 1)
         js_bodies = fetch_monitor_batch(cfg, to_fetch, js_file=True)
         for js_url, body in js_bodies.items():
             attempted_js.add(js_url)
@@ -1629,12 +1633,12 @@ def scope_roots_for_program(conn: sqlite3.Connection, program_id: int) -> list[s
 # Discovery
 # -----------------------------
 
-def run_subfinder(cfg: Config, domains: list[str], job_dir: Path, log_prefix: str = "") -> list[str]:
+def run_subfinder(cfg: Config, domains: list[str], job_dir: Path, log_prefix: str = "") -> set[str]:
     if not domains:
-        return []
+        return set()
     if cfg.dry_run:
         logging.info("[DRY_RUN] Skipping subfinder for %d domains", len(domains))
-        return []
+        return set()
 
     roots_file = job_dir / "roots.txt"
     roots_file.write_text("\n".join(domains) + "\n", encoding="utf-8")
@@ -1654,14 +1658,14 @@ def run_subfinder(cfg: Config, domains: list[str], job_dir: Path, log_prefix: st
     run_cmd(cmd, timeout=cfg.subfinder_timeout, log_prefix=log_prefix)
     
     if not out_file.exists():
-        return []
+        return set()
 
     subs = set()
     for line in out_file.read_text(encoding="utf-8").splitlines():
         s = line.strip().rstrip(".")
         if s:
             subs.add(s)
-    return sorted(list(subs))
+    return subs
 
 
 def update_subdomains(conn: sqlite3.Connection, program_id: int, discovered: set[str]) -> tuple[list[str], list[str]]:
@@ -3038,16 +3042,11 @@ def _run_web_pipeline(
             "\n".join(katana_normal_urls) + "\n", encoding="utf-8"
         )
 
-        new_param_urls = [u for u in katana_param_urls if u not in known_katana_urls]
-
-        # Nuclei receives only NEW parameter-bearing URLs
-        nuclei_scan_urls = dedupe_strings(new_param_urls)
-        # JS monitor receives normal pages as HTML seeds, JS files as direct targets
-        js_page_scan_urls = dedupe_strings(crawl_seed_urls + katana_normal_urls)
+        # Nuclei receives only NEW parameter-bearing URLs (not seen in previous runs)
+        nuclei_scan_urls = dedupe_strings([u for u in katana_param_urls if u not in known_katana_urls])
+        # JS monitor receives normal + param pages as HTML seeds, JS files as direct targets
+        js_page_scan_urls = dedupe_strings(katana_normal_urls + katana_param_urls)
         js_direct_scan_urls = katana_js_urls
-        (job_dir / "nuclei_scan_urls.txt").write_text(
-            "\n".join(nuclei_scan_urls) + "\n", encoding="utf-8"
-        )
 
         # ── Step 4: 3-way parallel (nuclei + js_html + js_js) ───────────
         nuclei_findings: list[dict[str, Any]] = []
@@ -3543,6 +3542,7 @@ def load_config() -> Config:
         asn_alive_timeout=int(env.get("ASN_ALIVE_TIMEOUT", "1800")),
         asn_max_ips=int(env.get("ASN_MAX_IPS", "65536")),
         asn_exclude_cdn=env.get("ASN_EXCLUDE_CDN", "true").strip().lower() in ("true", "1", "yes"),
+        subfinder_provider_config=env.get("SUBFINDER_PROVIDER_CONFIG", ""),
         subfinder_args=env.get("SUBFINDER_ARGS", ""),
         httpx_args=env.get("HTTPX_ARGS", ""),
         naabu_args=env.get("NAABU_ARGS", ""),
