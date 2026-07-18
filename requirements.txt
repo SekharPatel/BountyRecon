@@ -1,12 +1,19 @@
-# Python package requirements for bugBounty_auto_recon.py
-#
-# No third-party Python packages are required.
-# The script exclusively uses the Python 3.10+ standard library.
-#
-# Runtime requirements (Go binaries) that must be installed and available in your system PATH:
-# - subfinder (github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest)
-# - httpx (github.com/projectdiscovery/httpx/cmd/httpx@latest)
-# - naabu (github.com/projectdiscovery/naabu/v2/cmd/naabu@latest)
-# - katana (github.com/projectdiscovery/katana/cmd/katana@latest)
-# - nuclei (github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest)
-# - notify (github.com/projectdiscovery/notify/cmd/notify@latest)
+# Core
+python-dotenv>=1.0.0
+
+# Optional (recommended)
+orjson>=3.10.0
+rich>=14.0.0
+tabulate>=0.9.0
+
+# Notes:
+# The project primarily uses the Python standard library.
+# External functionality relies on ProjectDiscovery tools:
+# - subfinder
+# - httpx
+# - naabu
+# - nuclei
+# - katana
+# - asnmap
+# - mapcidr
+# - notify

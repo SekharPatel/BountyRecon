@@ -1,231 +1,197 @@
-# Bug Bounty Auto Recon
 
-`bugBounty_auto_recon.py` is a robust, program-aware reconnaissance pipeline built for authorized security testing and bug bounty hunters. 
+# Recon Pipeline
 
-It reads scoped targets, discovers subdomains, tracks historical state using SQLite, and exclusively scans newly discovered hosts to save time and resources. All events are logged gracefully, and notifications are broadcasted seamlessly using ProjectDiscovery's `notify` utility.
+> A program-aware reconnaissance pipeline for authorized security testing and bug bounty programs.
 
-Designed to be run repeatedly (via cron or systemd), this tool works completely headless.
+## Overview
 
-> **Disclaimer:** Use this tool only on assets you own or are explicitly authorized to test.
+This project automates the reconnaissance lifecycle for multiple bug bounty programs while keeping all collected data isolated in a SQLite database. The main scanner (`recon.py`) discovers assets, fingerprints them, scans for vulnerabilities, performs JavaScript analysis, and stores historical results. The companion exporter (`export.py`) generates interactive HTML reports and JSON exports.
 
----
+## Features
 
-## 🚀 Key Features
-
-* **Stateful Execution (SQLite)**: Subdomains and vulnerabilities are logged locally. Only *new* subdomains undergo the intensive scanning pipeline (HTTP probing, port scanning, crawling, and vulnerability scanning).
-* **Multi-Tool Pipeline**: 
-  1. `subfinder`: Discovers subdomains.
-  2. `httpx`: Identifies live web servers.
-  3. `naabu`: Scans open ports and fingerprints services.
-  4. `katana`: Crawls live URLs dynamically (Runs concurrently with Naabu).
-  5. Dual post-Katana scan: `nuclei` scans standard URLs while the built-in JS monitor recursively scans Katana-discovered JavaScript and normal HTML pages.
-  6. JS monitor: hashes JavaScript files, extracts built-in/custom regex findings, and tracks future changes in SQLite.
-* **Universal Notifications (`notify`)**: Replaced hardcoded Telegram support with ProjectDiscovery's `notify`. You can now receive alerts on Discord, Slack, Telegram, Teams, or custom webhooks.
-* **Step-by-Step Alerts**: Configurable progress tracking. Receive individual alerts as each tool finishes its execution, followed by a beautifully formatted Markdown summary report.
-* **Headless Service Ready**: Fully utilizes Python's `logging` module (no standard CLI `print()` noise) making it highly optimized to run as a Linux background service.
-* **Automated Bootstrapping**: Rapidly onboard new target domains right from the CLI.
+- Multi-program support (one scope file per target)
+- SQLite database with schema migrations
+- Subdomain discovery using Subfinder
+- Live host detection with HTTPX
+- Port scanning with Naabu
+- Vulnerability scanning with Nuclei
+- Web crawling with Katana
+- JavaScript monitoring and secret detection
+- ASN → CIDR → IP expansion
+- Historical scan tracking
+- HTML and JSON reporting
+- Artifact management
+- Configurable via `.env`
 
 ---
 
-## 🛠️ Requirements
-
-### Python
-* Python 3.10+
-* Only built-in standard library modules are used (no `pip install` required).
-
-### External Tools
-The following binaries must be installed and available in your system `$PATH`:
-* [subfinder](https://github.com/projectdiscovery/subfinder)
-* [httpx](https://github.com/projectdiscovery/httpx)
-* [naabu](https://github.com/projectdiscovery/naabu)
-* [katana](https://github.com/projectdiscovery/katana)
-* [nuclei](https://github.com/projectdiscovery/nuclei)
-* [notify](https://github.com/projectdiscovery/notify)
-
-Install them easily via Go:
-```bash
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-go install -v github.com/projectdiscovery/notify/cmd/notify@latest
-```
-
----
-
-## ⚙️ Configuration (.env)
-
-The script relies on a local `.env` file for configuration. Copy `.env.example` to `.env`.
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-### Key Variables
-
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `ROOT_DIR` | The master directory where all databases, targets, logs, and artifacts are stored. | `recon_watch_data` |
-| `NOTIFY_BIN` | Path to the `notify` binary. | `notify` |
-| `NOTIFY_ID` | Optional provider ID configured in your `provider-config.yaml` to route messages. | *(Blank)* |
-| `NOTIFY_STEP_BY_STEP` | If `true`, sends alerts after each tool finishes. If `false`, only sends a final summary. | `true` |
-| `JS_MONITOR_ENABLED` | Enables the built-in post-Katana JavaScript monitor. | `true` |
-| `JS_MONITOR_PATTERNS_FILE` | Optional JSON file containing `custom_patterns` regex definitions. | *(Blank)* |
-| `JS_MONITOR_RECURSION_DEPTH` | Recursive JavaScript discovery depth. | `3` |
-| `MAX_JOB_RETENTION_DAYS` | Automatically deletes tool output artifacts older than X days. | `30` |
-
-*(All tool binaries and timeouts are also configurable in the `.env` file).*
-
-Custom JS regex files use this shape:
-
-```json
-{
-  "custom_patterns": [
-    {
-      "name": "stripe_key",
-      "regex": "sk_live_[0-9a-zA-Z]{24,}",
-      "group_index": 0,
-      "ignore_case": false
-    }
-  ]
-}
-```
-
----
-
-## 🏗️ Setup & Usage
-
-### 1. Initialize the Environment
-Before running your first scan, initialize the core folder structure and SQLite database:
-
-```bash
-python3 bugBounty_auto_recon.py --setup
-```
-This creates the master `ROOT_DIR` (e.g., `recon_watch_data/`) along with the `targets/`, `work/`, `logs/`, and the empty `recon.db` database.
-
-### 2. Add a Target
-Easily bootstrap a new target domain into the pipeline:
-
-```bash
-python3 bugBounty_auto_recon.py -d example.com
-```
-This automatically formats the program name and creates `recon_watch_data/targets/example_com.txt` with your domain.
-
-### 3. Run the Pipeline
-Run the script to execute the full pipeline across all configured targets:
-
-```bash
-python3 bugBounty_auto_recon.py
-```
-*Note: If no domains exist in your `targets/` folder, the script will safely log an error and exit.*
-
----
-
-## 📂 Data Storage & Artifacts
-
-All data is sandboxed securely under your configured `ROOT_DIR`. 
+# Architecture
 
 ```text
-recon_watch_data/
-├── recon.db                    # SQLite tracking database
-├── logs/
-│   └── recon_watch.log         # Headless service logs
+Targets
+   │
+   ▼
+Subfinder
+   │
+   ▼
+SQLite Database
+   │
+   ├── HTTPX
+   ├── Naabu
+   ├── Katana
+   ├── Nuclei
+   ├── JS Monitor
+   └── ASN Enumeration
+          │
+          ▼
+      HTML / JSON Reports
+```
+
+## Scan Workflow
+
+```mermaid
+flowchart TD
+A[targets/*.txt] --> B[Subfinder]
+B --> C[New Subdomains]
+C --> D[HTTPX]
+D --> E[Naabu]
+D --> F[Katana]
+E --> G[Nuclei]
+F --> H[JavaScript Monitor]
+G --> I[SQLite]
+H --> I
+I --> J[export.py]
+J --> K[Interactive HTML]
+J --> L[JSON Export]
+```
+
+## Installation
+
+### Requirements
+
+- Python 3.11+
+- Linux
+- Go
+- SQLite
+
+### Install Python
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Install ProjectDiscovery Tools
+
+```bash
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+go install github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest
+go install github.com/projectdiscovery/notify/cmd/notify@latest
+```
+
+## Project Structure
+
+```text
+root/
+├── recon.py
+├── export.py
+├── .env
 ├── targets/
-│   ├── example_com.txt         # Program scope files
-│   └── company_b.txt
-└── work/                       # Artifacts (JSONL, TXT) generated per run
-    └── example_com/
-        └── 20260616_120000/
-            ├── roots.txt
-            ├── new_subdomains.txt
-            ├── httpx_hosts.txt
-            ├── naabu.jsonl
-            ├── katana_crawled_urls.txt
-            ├── nuclei.jsonl
-            ├── js_monitor_js_files.txt
-            ├── js_monitor_changed_files.jsonl
-            └── js_monitor_new_findings.jsonl
+├── logs/
+├── work/
+├── reports/
+└── recon.db
 ```
 
-### Target Files Layout
-If `targets/example_com.txt` contains multiple domains, they are scanned together as one overarching program.
+## Configuration
 
-```text
-# Main production scope
-example.com
-example.net
+Create a `.env` beside `recon.py`.
 
-# Secondary brand
-api.example.org
-```
+Important variables include:
 
----
+- ROOT_DIR
+- SUBFINDER_BIN
+- HTTPX_BIN
+- NAABU_BIN
+- NUCLEI_BIN
+- KATANA_BIN
+- ASNMAP_BIN
+- MAPCIDR_BIN
+- NUCLEI_SEVERITIES
+- KATANA_DEPTH
+- ASN_ENABLED
+- JS_MONITOR_ENABLED
+- MAX_JOB_RETENTION_DAYS
 
-## 📡 Notifications
+## Running
 
-The integration with `notify` enables highly formatted Markdown reports natively supported by platforms like Discord and Slack.
+Run reconnaissance:
 
-**Step-by-Step Reporting (`NOTIFY_STEP_BY_STEP=true`)**:
-```text
-[example_com] Step 1 - subfinder completed successfully
-[example_com] Step 2 - httpx completed successfully
-[example_com] Step 3 - naabu completed successfully
-[example_com] Step 4 - katana completed successfully
-[example_com] Step 5 - nuclei completed successfully
-```
-
-**Final Recon Summary**:
-After execution, a detailed Markdown report is fired off containing:
-* Program name and scope root count.
-* Subfinder discovered / new / known host counts.
-* HTTPX live host validation metrics.
-* Naabu port & service result count.
-* Katana newly crawled URL count.
-* JS monitor file/change/finding counts, including critical new secret-like findings.
-* Nuclei vulnerability findings (grouped by severity).
-* Detailed blocks featuring Live Host specifics (URL, Status, Tech Stack, Ports, and Vulns).
-
----
-
-## 🐧 Linux Service Setup (Systemd)
-
-Because this script tracks state and runs silently, it is perfect for automation via cron or systemd timers. 
-
-**Example systemd service** (`/etc/systemd/system/recon-watch.service`):
-```ini
-[Unit]
-Description=Bug Bounty Auto Recon Scan
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=recon
-WorkingDirectory=/opt/recon-watch
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/recon/go/bin
-ExecStart=/usr/bin/python3 /opt/recon-watch/bugBounty_auto_recon.py
-NoNewPrivileges=true
-PrivateTmp=true
-```
-
-**Example systemd timer** (`/etc/systemd/system/recon-watch.timer`):
-```ini
-[Unit]
-Description=Run Recon Watch hourly
-
-[Timer]
-OnCalendar=hourly
-Persistent=true
-Unit=recon-watch.service
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable the automation:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now recon-watch.timer
+python3 recon.py
 ```
+
+Generate report:
+
+```bash
+python3 export.py --db recon.db --program company_name
+```
+
+Export all programs:
+
+```bash
+python3 export.py --db recon.db --all-programs
+```
+
+## Database
+
+Primary tables:
+
+- programs
+- scope_domains
+- subdomains
+- httpx_results
+- ports
+- nuclei_findings
+- katana_results
+- js_files
+- js_findings
+- asn_ranges
+- asn_ips
+- runs
+- artifacts
+
+## Outputs
+
+- SQLite database
+- HTML dashboard
+- JSON export
+- Logs
+- Scan artifacts
+- Historical records
+
+## Troubleshooting
+
+- Verify ProjectDiscovery binaries are in PATH.
+- Run `nuclei -update-templates`.
+- Ensure the `.env` file is configured.
+- Check `logs/recon_watch.log`.
+- Verify write permissions for `ROOT_DIR`.
+
+## Best Practices
+
+- Use only on authorized targets.
+- Update templates regularly.
+- Schedule scans with systemd or cron.
+- Back up the SQLite database.
+- Periodically prune old artifacts.
+
+## License
+
+Use only for authorized security assessments and bug bounty programs.

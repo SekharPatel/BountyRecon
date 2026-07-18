@@ -2,7 +2,7 @@
 """
 export.py
 
-Export tool for bugBounty_auto_recon database.
+Export tool for recon.py database.
 Generates interactive HTML reports and JSON exports with advanced filtering.
 
 Usage:
