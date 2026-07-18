@@ -90,12 +90,13 @@ import argparse
 import urllib.parse
 import urllib.request
 import urllib.error
+import ssl
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Iterator
 
 
 # -----------------------------
@@ -162,6 +163,7 @@ class Config:
     js_monitor_enabled: bool = True
     js_monitor_threads: int = 15
     js_monitor_timeout: int = 30
+    js_monitor_tool_timeout: int = 900
     js_monitor_recursion_depth: int = 3
     js_monitor_deep: bool = False
     js_monitor_patterns_file: str = ""
@@ -181,7 +183,7 @@ def setup_logging(log_file: Path) -> None:
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.handlers.RotatingFileHandler(
-                log_file, maxBytes=10 * 1024 * 1024, backupCount=5,
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
             ),
         ],
     )
@@ -605,6 +607,9 @@ JS_USER_AGENT = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+# Hard cap on response body size to prevent OOM on unexpectedly large responses
+MAX_JS_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB
+
 JS_SKIP_DOMAINS = {
     "www.googletagmanager.com",
     "www.google-analytics.com",
@@ -778,53 +783,149 @@ def filter_monitor_urls(urls: list[str], roots: list[str], allow_external: bool,
 def get_js_opener() -> urllib.request.OpenerDirector:
     opener = getattr(_js_thread_local, "opener", None)
     if opener is None:
-        opener = urllib.request.build_opener()
+        # Skip SSL verification — many bug bounty targets have self-signed,
+        # expired, or misconfigured certificates that would cause every fetch
+        # to fail silently.  This mirrors what httpx/katana do by default.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        https_handler = urllib.request.HTTPSHandler(context=ctx)
+        http_handler = urllib.request.HTTPHandler()
+        opener = urllib.request.build_opener(http_handler, https_handler)
         _js_thread_local.opener = opener
     return opener
 
 
+def _read_with_deadline(resp: Any, max_bytes: int, deadline: float) -> bytes:
+    """Read response body in chunks, aborting if deadline or size limit is exceeded."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError("Total transfer deadline exceeded")
+        remaining_bytes = max_bytes - total
+        if remaining_bytes <= 0:
+            break
+        chunk = resp.read(min(65536, remaining_bytes))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 def fetch_monitor_url(cfg: Config, url: str, js_file: bool = False) -> Optional[str]:
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": JS_USER_AGENT,
-                "Accept": "*/*" if js_file else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            },
-        )
-        with get_js_opener().open(req, timeout=cfg.js_monitor_timeout) as resp:
-            raw = resp.read()
+    """Fetch a single URL with per-request hard deadline, size cap, and content-type validation."""
+    max_retries = 2
+    timeout_per_request = cfg.js_monitor_timeout
+    for attempt in range(max_retries):
+        resp = None
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": JS_USER_AGENT,
+                    "Accept": "*/*" if js_file else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "identity",
+                    "Connection": "close",
+                },
+            )
+            # Hard deadline: socket timeout + total transfer time capped
+            deadline = time.time() + timeout_per_request
+            resp = get_js_opener().open(req, timeout=min(timeout_per_request, 15))
+
+            # Check for cross-domain redirects (urllib follows redirects silently)
+            final_url = resp.url if hasattr(resp, "url") else url
+            if final_url:
+                orig_host = host_from_url(url).lower().rstrip(".")
+                final_host = host_from_url(final_url).lower().rstrip(".")
+                if orig_host and final_host and orig_host != final_host:
+                    # Redirected to a completely different domain — likely a login/SSO page
+                    if not final_host.endswith("." + orig_host) and not orig_host.endswith("." + final_host):
+                        logging.info("JS fetch cross-domain redirect %s → %s, skipping", url, final_url)
+                        return None
+
+            # Content-type validation for JS files: reject HTML error pages
+            if js_file:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if "text/html" in content_type or "application/xhtml" in content_type:
+                    logging.info("JS fetch got HTML response for JS URL (likely error/redirect page): %s", url)
+                    return None
+
+            # Read body with hard deadline and size cap
+            raw = _read_with_deadline(resp, MAX_JS_RESPONSE_BYTES, deadline)
             charset = resp.headers.get_content_charset() or "utf-8"
             try:
                 return raw.decode(charset, errors="replace")
             except LookupError:
                 return raw.decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        return None
+        except urllib.error.HTTPError as exc:
+            logging.info("JS fetch HTTP %d: %s", exc.code, url)
+            return None
+        except TimeoutError as exc:
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)
+                continue
+            logging.info("JS fetch timeout: %s — %s", url, exc)
+            return None
+        except (urllib.error.URLError, ValueError, OSError) as exc:
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)
+                continue
+            logging.info("JS fetch failed: %s — %s", url, exc)
+            return None
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+    return None
 
 
-def fetch_monitor_batch(cfg: Config, urls: list[str], js_file: bool = False, max_time_seconds: int = 900) -> dict[str, Optional[str]]:
+def iter_fetch_monitor(cfg: Config, urls: list[str], js_file: bool = False) -> Iterator[tuple[str, Optional[str]]]:
+    """Yields (url, response_body) one by one as they complete.
+    
+    Abandons running threads and prevents memory leaks if timeout occurs.
+    """
     if not urls:
-        return {}
-    results: dict[str, Optional[str]] = {}
+        return
+    max_time_seconds = cfg.js_monitor_tool_timeout
     workers = max(1, min(cfg.js_monitor_threads, len(urls)))
-    start_time = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_monitor_url, cfg, url, js_file): url for url in urls}
-        for future in as_completed(futures):
-            url = futures[future]
+    batch_start = time.time()
+    timed_out = False
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {}
+    try:
+        for url in urls:
+            futures[pool.submit(fetch_monitor_url, cfg, url, js_file)] = url
+            
+        for future in as_completed(futures, timeout=max(1, max_time_seconds - int(time.time() - batch_start))):
+            url = futures.pop(future)  # Remove reference immediately to free memory
             try:
-                results[url] = future.result()
+                res = future.result(timeout=5)
             except Exception:
-                results[url] = None
-                
-            if time.time() - start_time > max_time_seconds:
-                logging.warning("JS monitor batch exceeded max time of %d seconds. Canceling remaining.", max_time_seconds)
-                for f in futures:
-                    f.cancel()
+                res = None
+            yield url, res
+
+            if time.time() - batch_start > max_time_seconds:
+                timed_out = True
                 break
-    return results
+    except TimeoutError:
+        timed_out = True
+    finally:
+        if timed_out:
+            pending = len(futures)
+            logging.warning(
+                "JS monitor batch timeout (%ds): abandoned %d remaining URLs",
+                max_time_seconds, pending,
+            )
+        # Cancel queued (not yet started) futures
+        for f in futures:
+            f.cancel()
+        # Shut down without waiting for stuck threads (daemon-like behavior)
+        pool.shutdown(wait=False)
 
 
 def discover_js_html(html_text: str, base: str) -> list[str]:
@@ -1083,6 +1184,30 @@ def mask_sensitive_value(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def _write_js_monitor_output_files(
+    job_dir: Path,
+    result: dict[str, Any],
+    seed_pages: list[str],
+    direct_js: list[str],
+) -> None:
+    """Write JS monitor output files. Called from finally block to guarantee output."""
+    try:
+        (job_dir / "js_monitor_seed_pages.txt").write_text("\n".join(seed_pages) + "\n", encoding="utf-8")
+        (job_dir / "js_monitor_direct_js.txt").write_text("\n".join(direct_js) + "\n", encoding="utf-8")
+        (job_dir / "js_monitor_js_files.txt").write_text(
+            "\n".join(result.get("discovered_js_urls", [])) + "\n", encoding="utf-8"
+        )
+        (job_dir / "js_monitor_failed_js.txt").write_text(
+            "\n".join(result.get("failed_js_urls", [])) + "\n", encoding="utf-8"
+        )
+        (job_dir / "js_monitor_failed_pages.txt").write_text(
+            "\n".join(result.get("failed_page_urls", [])) + "\n", encoding="utf-8"
+        )
+        write_jsonl(job_dir / "js_monitor_findings.jsonl", result.get("findings", []))
+    except Exception:
+        logging.exception("JS Monitor: failed to write output files")
+
+
 def run_js_monitor_scan(
     cfg: Config,
     page_urls: list[str],
@@ -1116,51 +1241,26 @@ def run_js_monitor_scan(
         result["status"] = "dry_run"
         return result
 
-    custom_patterns = load_js_custom_patterns(cfg.js_monitor_patterns_file)
-    result["custom_patterns_loaded"] = len(custom_patterns)
+    # These are populated early so the finally block can always write them
+    seed_pages: list[str] = []
+    direct_js: list[str] = []
 
-    seed_pages = filter_monitor_urls(page_urls, roots, cfg.js_monitor_allow_external, js_only=False)
-    seed_pages = [url for url in seed_pages if not is_probable_js_url(url)]
-    direct_js = filter_monitor_urls(direct_js_urls, roots, cfg.js_monitor_allow_external, js_only=True)
-    result["seed_page_urls"] = seed_pages
-    result["direct_js_urls"] = direct_js
+    try:
+        custom_patterns = load_js_custom_patterns(cfg.js_monitor_patterns_file)
+        result["custom_patterns_loaded"] = len(custom_patterns)
 
-    discovered_js: set[str] = set(direct_js)
-    js_sources: dict[str, str] = {url: "katana" for url in direct_js}
+        seed_pages = filter_monitor_urls(page_urls, roots, cfg.js_monitor_allow_external, js_only=False)
+        seed_pages = [url for url in seed_pages if not is_probable_js_url(url)]
+        direct_js = filter_monitor_urls(direct_js_urls, roots, cfg.js_monitor_allow_external, js_only=True)
+        result["seed_page_urls"] = seed_pages
+        result["direct_js_urls"] = direct_js
 
-    if seed_pages:
-        logging.info("JS Monitor: Fetching %d seed HTML pages...", len(seed_pages))
-        page_bodies = fetch_monitor_batch(cfg, seed_pages, js_file=False)
-        for page_url, body in page_bodies.items():
-            if not body:
-                result["failed_page_urls"].append(page_url)
-                continue
-            result["html_pages_scanned"] += 1
-            html_findings = extract_monitor_findings(body, custom_patterns, include_comments=False)
-            for finding in html_findings:
-                finding.update({"source_url": page_url, "source_type": "html"})
-            result["findings"].extend(html_findings)
+        discovered_js: set[str] = set(direct_js)
+        js_sources: dict[str, str] = {url: "katana" for url in direct_js}
 
-            for js_url in filter_monitor_urls(discover_js_html(body, page_url), roots, cfg.js_monitor_allow_external, js_only=True):
-                discovered_js.add(js_url)
-                js_sources.setdefault(js_url, page_url)
-
-    if cfg.js_monitor_deep and seed_pages:
-        origins = dedupe_strings(
-            [
-                f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
-                for url in seed_pages
-                if urllib.parse.urlparse(url).scheme and urllib.parse.urlparse(url).netloc
-            ]
-        )
-        sitemap_pages: list[str] = []
-        for origin in origins:
-            sitemap_pages.extend(fetch_sitemap_routes(cfg, origin, roots)[:20])
-        sitemap_pages = [url for url in dedupe_strings(sitemap_pages) if url not in set(seed_pages)]
-        if sitemap_pages:
-            logging.info("JS Monitor: Fetching %d deep HTML sitemap pages...", len(sitemap_pages))
-            page_bodies = fetch_monitor_batch(cfg, sitemap_pages, js_file=False)
-            for page_url, body in page_bodies.items():
+        if seed_pages:
+            logging.info("JS Monitor: Fetching %d seed HTML pages...", len(seed_pages))
+            for page_url, body in iter_fetch_monitor(cfg, seed_pages, js_file=False):
                 if not body:
                     result["failed_page_urls"].append(page_url)
                     continue
@@ -1169,52 +1269,91 @@ def run_js_monitor_scan(
                 for finding in html_findings:
                     finding.update({"source_url": page_url, "source_type": "html"})
                 result["findings"].extend(html_findings)
+
                 for js_url in filter_monitor_urls(discover_js_html(body, page_url), roots, cfg.js_monitor_allow_external, js_only=True):
                     discovered_js.add(js_url)
                     js_sources.setdefault(js_url, page_url)
 
-    attempted_js: set[str] = set()
-    fetched_js: set[str] = set()
-    public_path = ""
-    max_depth = max(1, cfg.js_monitor_recursion_depth)
+        if cfg.js_monitor_deep and seed_pages:
+            origins = dedupe_strings(
+                [
+                    f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
+                    for url in seed_pages
+                    if urllib.parse.urlparse(url).scheme and urllib.parse.urlparse(url).netloc
+                ]
+            )
+            sitemap_pages: list[str] = []
+            for origin in origins:
+                sitemap_pages.extend(fetch_sitemap_routes(cfg, origin, roots)[:20])
+            sitemap_pages = [url for url in dedupe_strings(sitemap_pages) if url not in set(seed_pages)]
+            if sitemap_pages:
+                logging.info("JS Monitor: Fetching %d deep HTML sitemap pages...", len(sitemap_pages))
+                for page_url, body in iter_fetch_monitor(cfg, sitemap_pages, js_file=False):
+                    if not body:
+                        result["failed_page_urls"].append(page_url)
+                        continue
+                    result["html_pages_scanned"] += 1
+                    html_findings = extract_monitor_findings(body, custom_patterns, include_comments=False)
+                    for finding in html_findings:
+                        finding.update({"source_url": page_url, "source_type": "html"})
+                    result["findings"].extend(html_findings)
+                    for js_url in filter_monitor_urls(discover_js_html(body, page_url), roots, cfg.js_monitor_allow_external, js_only=True):
+                        discovered_js.add(js_url)
+                        js_sources.setdefault(js_url, page_url)
 
-    for _depth in range(max_depth):
-        to_fetch = sorted(discovered_js - attempted_js)
-        if not to_fetch:
-            break
-        logging.info("JS Monitor: Fetching %d JS files at depth %d...", len(to_fetch), _depth + 1)
-        js_bodies = fetch_monitor_batch(cfg, to_fetch, js_file=True)
-        for js_url, body in js_bodies.items():
-            attempted_js.add(js_url)
-            if body is None:
-                result["failed_js_urls"].append(js_url)
-                continue
-            fetched_js.add(js_url)
-            content_bytes = body.encode("utf-8", errors="replace")
-            result["js_hashes"][js_url] = hashlib.sha256(content_bytes).hexdigest()
-            result["js_meta"][js_url] = {
-                "content_length": len(content_bytes),
-                "source_url": js_sources.get(js_url, ""),
-            }
-            js_findings = extract_monitor_findings(body, custom_patterns, include_comments=True)
-            for finding in js_findings:
-                finding.update({"source_url": js_url, "source_type": "javascript"})
-            result["findings"].extend(js_findings)
+        attempted_js: set[str] = set()
+        fetched_js: set[str] = set()
+        public_path = ""
+        max_depth = max(1, cfg.js_monitor_recursion_depth)
 
-            if not public_path:
-                public_path = get_webpack_public_path(body)
-            for child_js in filter_monitor_urls(discover_js_from_js(body, js_url, public_path), roots, cfg.js_monitor_allow_external, js_only=True):
-                discovered_js.add(child_js)
-                js_sources.setdefault(child_js, js_url)
+        for _depth in range(max_depth):
+            to_fetch = sorted(discovered_js - attempted_js)
+            if not to_fetch:
+                break
+            logging.info("JS Monitor: Fetching %d JS files at depth %d/%d...", len(to_fetch), _depth + 1, max_depth)
+            for js_url, body in iter_fetch_monitor(cfg, to_fetch, js_file=True):
+                attempted_js.add(js_url)
+                if body is None:
+                    result["failed_js_urls"].append(js_url)
+                    continue
+                fetched_js.add(js_url)
+                content_bytes = body.encode("utf-8", errors="replace")
+                result["js_hashes"][js_url] = hashlib.sha256(content_bytes).hexdigest()
+                result["js_meta"][js_url] = {
+                    "content_length": len(content_bytes),
+                    "source_url": js_sources.get(js_url, ""),
+                }
+                js_findings = extract_monitor_findings(body, custom_patterns, include_comments=True)
+                for finding in js_findings:
+                    finding.update({"source_url": js_url, "source_type": "javascript"})
+                result["findings"].extend(js_findings)
 
-    result["discovered_js_urls"] = sorted(discovered_js)
-    result["fetched_js_urls"] = sorted(fetched_js)
+                if not public_path:
+                    public_path = get_webpack_public_path(body)
+                for child_js in filter_monitor_urls(discover_js_from_js(body, js_url, public_path), roots, cfg.js_monitor_allow_external, js_only=True):
+                    discovered_js.add(child_js)
+                    js_sources.setdefault(child_js, js_url)
 
-    (job_dir / "js_monitor_seed_pages.txt").write_text("\n".join(seed_pages) + "\n", encoding="utf-8")
-    (job_dir / "js_monitor_direct_js.txt").write_text("\n".join(direct_js) + "\n", encoding="utf-8")
-    (job_dir / "js_monitor_js_files.txt").write_text("\n".join(result["discovered_js_urls"]) + "\n", encoding="utf-8")
-    (job_dir / "js_monitor_failed_js.txt").write_text("\n".join(result["failed_js_urls"]) + "\n", encoding="utf-8")
-    write_jsonl(job_dir / "js_monitor_findings.jsonl", result["findings"])
+        result["discovered_js_urls"] = sorted(discovered_js)
+        result["fetched_js_urls"] = sorted(fetched_js)
+
+        logging.info(
+            "JS Monitor: completed — discovered=%d fetched=%d failed_js=%d failed_pages=%d findings=%d",
+            len(discovered_js),
+            len(fetched_js),
+            len(result["failed_js_urls"]),
+            len(result["failed_page_urls"]),
+            len(result["findings"]),
+        )
+
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        logging.exception("JS Monitor: scan failed with exception")
+
+    finally:
+        # Always write output files, even on partial failure or crash
+        _write_js_monitor_output_files(job_dir, result, seed_pages, direct_js)
 
     return result
 
@@ -3084,12 +3223,15 @@ def _run_web_pipeline(
 
                 for future in as_completed(futures):
                     tool_name = futures[future]
-                    if tool_name == "nuclei":
-                        nuclei_findings = future.result()
-                        logging.info("[%s] Web Pipeline – nuclei completed", program_name)
-                    elif tool_name == "js_monitor":
-                        raw_js_monitor_result = future.result()
-                        logging.info("[%s] Web Pipeline – JS monitor completed", program_name)
+                    try:
+                        if tool_name == "nuclei":
+                            nuclei_findings = future.result()
+                            logging.info("[%s] Web Pipeline – nuclei completed", program_name)
+                        elif tool_name == "js_monitor":
+                            raw_js_monitor_result = future.result()
+                            logging.info("[%s] Web Pipeline – JS monitor completed", program_name)
+                    except Exception:
+                        logging.exception("[%s] Web Pipeline – %s failed in post-katana stage", program_name, tool_name)
 
             if nuclei_findings:
                 store_nuclei(conn, program_id, nuclei_findings)
@@ -3420,7 +3562,7 @@ TIMEOUT_KEYS = {
     "SUBFINDER_TIMEOUT", "HTTPX_TIMEOUT", "NAABU_TIMEOUT",
     "NUCLEI_TIMEOUT", "KATANA_TIMEOUT", "KATANA_DEPTH",
     "MAX_JOB_RETENTION_DAYS", "JS_MONITOR_THREADS", "JS_MONITOR_TIMEOUT",
-    "JS_MONITOR_RECURSION_DEPTH",
+    "JS_MONITOR_TOOL_TIMEOUT", "JS_MONITOR_RECURSION_DEPTH",
 }
 
 # Keys that are allowed to be empty or missing
@@ -3553,6 +3695,7 @@ def load_config() -> Config:
         js_monitor_enabled=env.get("JS_MONITOR_ENABLED", "true").strip().lower() in ("true", "1", "yes"),
         js_monitor_threads=int(env.get("JS_MONITOR_THREADS", "15")),
         js_monitor_timeout=int(env.get("JS_MONITOR_TIMEOUT", "30")),
+        js_monitor_tool_timeout=int(env.get("JS_MONITOR_TOOL_TIMEOUT", "900")),
         js_monitor_recursion_depth=int(env.get("JS_MONITOR_RECURSION_DEPTH", "3")),
         js_monitor_deep=env.get("JS_MONITOR_DEEP", "false").strip().lower() in ("true", "1", "yes"),
         js_monitor_patterns_file=js_patterns_file,

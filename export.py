@@ -3,14 +3,12 @@
 export.py
 
 Export tool for bugBounty_auto_recon database.
-Generates interactive HTML reports and JSON exports with filtering capabilities.
+Generates interactive HTML reports and JSON exports with advanced filtering.
 
 Usage:
     python export.py --db /path/to/recon.db --program "company_1"
     python export.py --db /path/to/recon.db --all-programs --output ./reports
     python export.py --db /path/to/recon.db --list-programs
-    python export.py --db /path/to/recon.db --program "company_1" --format json
-    python export.py --db /path/to/recon.db --program "company_1" --severities critical,high
 """
 
 from __future__ import annotations
@@ -24,11 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from html import escape
-import hashlib
 
 
 # =============================================================================
-# Data Models
+# Data Models (unchanged)
 # =============================================================================
 
 @dataclass
@@ -213,22 +210,26 @@ class ExportData:
         }
 
     def get_summary(self) -> dict[str, Any]:
+        all_ports = set()
+        for pr in self.port_results:
+            for p in pr.open_ports.split(","):
+                p = p.strip()
+                if p:
+                    all_ports.add(p)
         return {
             "total_subdomains": len(self.subdomains),
             "alive_subdomains": sum(1 for s in self.subdomains if s.alive),
-            "unique_urls": len(set(
-                h.url for h in self.httpx_results if h.url
-            )),
+            "dead_subdomains": sum(1 for s in self.subdomains if not s.alive),
+            "unique_urls": len(set(h.url for h in self.httpx_results if h.url)),
             "total_ports": len(self.port_results),
-            "unique_open_ports": len(set(
-                p for pr in self.port_results for p in pr.open_ports.split(",")
-            )) if self.port_results else 0,
+            "unique_open_ports": len(all_ports),
             "nuclei_findings": len(self.nuclei_findings),
             "nuclei_by_severity": self._count_by_severity(),
             "katana_urls": len(self.katana_urls),
             "unique_katana_urls": len(set(k.url for k in self.katana_urls)),
             "js_files": len(self.js_files),
             "active_js_files": sum(1 for j in self.js_files if j.is_active),
+            "inactive_js_files": sum(1 for j in self.js_files if not j.is_active),
             "js_findings": len(self.js_findings),
             "js_findings_by_category": self._count_js_categories(),
             "critical_js_findings": self._count_critical_js(),
@@ -237,6 +238,7 @@ class ExportData:
             "alive_asn_ips": sum(1 for a in self.asn_ips if a.alive),
             "total_runs": len(self.run_history),
             "last_run": self.run_history[0].started_at if self.run_history else None,
+            "status_codes": self._count_status_codes(),
         }
 
     def _count_by_severity(self) -> dict[str, int]:
@@ -255,6 +257,18 @@ class ExportData:
     def _count_critical_js(self) -> int:
         critical_categories = {"api_key", "aws_key", "aws_secret", "google_api_key", "credential", "jwt"}
         return sum(1 for f in self.js_findings if f.category in critical_categories and f.is_active)
+
+    def _count_status_codes(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for h in self.httpx_results:
+            code = str(h.status_code or "unknown")
+            # Group by hundred
+            if code.isdigit():
+                group = code[0] + "xx"
+            else:
+                group = "other"
+            counts[group] = counts.get(group, 0) + 1
+        return dict(sorted(counts.items()))
 
 
 # =============================================================================
@@ -297,21 +311,18 @@ class DatabaseExtractor:
         if not self.conn:
             self.connect()
 
-        # Get program info
         prog_row = self.conn.execute(
             "SELECT * FROM programs WHERE id = ?", (program_id,)
         ).fetchone()
         if not prog_row:
             raise ValueError(f"Program ID {program_id} not found")
 
-        # Get scope domains
         scope_rows = self.conn.execute(
             "SELECT root_domain FROM scope_domains WHERE program_id = ? ORDER BY root_domain",
             (program_id,)
         ).fetchall()
         scope_domains = [r["root_domain"] for r in scope_rows]
 
-        # Calculate stats
         stats = self._get_program_stats(program_id)
 
         program = Program(
@@ -331,30 +342,15 @@ class DatabaseExtractor:
             exported_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
         )
 
-        # Extract subdomains with port and nuclei count
         data.subdomains = self._extract_subdomains(program_id)
-
-        # Extract HTTPX results
         data.httpx_results = self._extract_httpx_results(program_id)
-
-        # Extract port results
         data.port_results = self._extract_port_results(program_id)
-
-        # Extract nuclei findings (with optional severity filter)
         data.nuclei_findings = self._extract_nuclei_findings(program_id, severity_filter)
-
-        # Extract katana URLs
         data.katana_urls = self._extract_katana_urls(program_id)
-
-        # Extract JS files and findings
         data.js_files = self._extract_js_files(program_id)
         data.js_findings = self._extract_js_findings(program_id)
-
-        # Extract ASN data
         data.asn_ranges = self._extract_asn_ranges(program_id)
         data.asn_ips = self._extract_asn_ips(program_id)
-
-        # Extract run history
         data.run_history = self._extract_run_history(program_id)
 
         return data
@@ -650,27 +646,11 @@ def export_json(data: ExportData, output_path: Path) -> None:
 
 
 # =============================================================================
-# HTML Report Generator
+# HTML Report Generator - FIXED VERSION
 # =============================================================================
 
 class HTMLReportGenerator:
     CRITICAL_JS_CATEGORIES = {"api_key", "aws_key", "aws_secret", "google_api_key", "credential", "jwt"}
-    SEVERITY_COLORS = {
-        "critical": "#dc2626",
-        "high": "#ea580c",
-        "medium": "#ca8a04",
-        "low": "#2563eb",
-        "info": "#6b7280",
-        "unknown": "#6b7280",
-    }
-    SEVERITY_BG = {
-        "critical": "rgba(220,38,38,0.15)",
-        "high": "rgba(234,88,12,0.15)",
-        "medium": "rgba(202,138,4,0.15)",
-        "low": "rgba(37,99,235,0.15)",
-        "info": "rgba(107,114,128,0.15)",
-        "unknown": "rgba(107,114,128,0.15)",
-    }
 
     def __init__(self, data: ExportData):
         self.data = data
@@ -683,782 +663,1068 @@ class HTMLReportGenerator:
             f.write(html_content)
         print(f"[+] HTML report exported: {output_path}")
 
+    def _esc(self, s: Any) -> str:
+        return escape(str(s) if s is not None else "")
+
     def _build_html(self) -> str:
+        # Safely encode JSON to prevent any XSS or HTML parser breakage
+        safe_json = json.dumps(self.data.to_dict(), default=str, ensure_ascii=False).replace("<", "\\u003c")
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Recon Report - {escape(self.data.program.name)}</title>
+    <title>Recon Report - {self._esc(self.data.program.name)}</title>
     <style>{self._get_css()}</style>
 </head>
 <body>
-    <div class="container">
-        {self._render_header()}
+    {self._render_header()}
+    <main class="main-container">
         {self._render_summary_cards()}
         {self._render_tabs()}
+        {self._render_filter_panel()}
         {self._render_tab_content()}
-    </div>
+    </main>
+    <script type="application/json" id="recon-data">
+        {safe_json}
+    </script>
     <script>{self._get_js()}</script>
 </body>
 </html>"""
 
     def _render_header(self) -> str:
+        scope_tags = "".join(
+            f'<span class="scope-tag">{self._esc(d)}</span>' 
+            for d in self.data.program.scope_domains[:8]
+        )
+        more_count = len(self.data.program.scope_domains) - 8
+        if more_count > 0:
+            scope_tags += f'<span class="scope-tag scope-more">+{more_count} more</span>'
+        
         return f"""
         <header class="header">
-            <div class="header-content">
-                <h1>🛡️ Recon Report</h1>
-                <div class="program-info">
-                    <span class="program-name">{escape(self.data.program.name)}</span>
-                    <span class="export-time">Exported: {escape(self.data.exported_at)}</span>
+            <div class="header-inner">
+                <div class="header-left">
+                    <h1 class="header-title">🛡️ Recon Report</h1>
+                    <div class="header-meta">
+                        <span class="program-badge">{self._esc(self.data.program.name)}</span>
+                        <span class="export-time">Exported: {self._esc(self.data.exported_at)}</span>
+                    </div>
                 </div>
-                <div class="scope-tags">
-                    {"".join(f'<span class="scope-tag">{escape(d)}</span>' for d in self.data.program.scope_domains[:10])}
-                    {f'<span class="scope-tag more">+{len(self.data.program.scope_domains) - 10} more</span>' if len(self.data.program.scope_domains) > 10 else ''}
+                <div class="header-actions">
+                    <button class="btn btn-outline" onclick="downloadJSON()">📄 JSON</button>
                 </div>
+            </div>
+            <div class="scope-bar">
+                <span class="scope-label">Scope:</span>
+                {scope_tags}
             </div>
         </header>"""
 
     def _render_summary_cards(self) -> str:
         s = self.summary
         cards = [
-            ("🌐", "Subdomains", s["total_subdomains"], f"{s['alive_subdomains']} alive"),
-            ("🔗", "Unique URLs", s["unique_urls"], f"{len(self.data.httpx_results)} total probes"),
-            ("🚪", "Open Ports", s["unique_open_ports"], f"{s['total_ports']} hosts scanned"),
-            ("⚡", "Vulnerabilities", s["nuclei_findings"], self._severity_badges(s["nuclei_by_severity"])),
-            ("🕷️", "Katana URLs", s["unique_katana_urls"], f"{s['katana_urls']} total found"),
-            ("📜", "JS Files", s["active_js_files"], f"{s['js_files']} total"),
-            ("🔍", "JS Findings", s["js_findings"], f"{s['critical_js_findings']} critical"),
-            ("📡", "ASN IPs", s["alive_asn_ips"], f"{s['asn_ranges']} ranges"),
+            ("🌐", "Subdomains", s["total_subdomains"], f"✓ {s['alive_subdomains']} alive · ✗ {s['dead_subdomains']} dead", "#3b82f6"),
+            ("🔗", "Unique URLs", s["unique_urls"], f"{len(self.data.httpx_results)} total probes", "#8b5cf6"),
+            ("🚪", "Open Ports", s["unique_open_ports"], f"{s['total_ports']} hosts scanned", "#06b6d4"),
+            ("⚡", "Vulns", s["nuclei_findings"], self._severity_summary(s["nuclei_by_severity"]), "#ef4444"),
+            ("🕷️", "Katana URLs", s["unique_katana_urls"], f"{s['katana_urls']} total found", "#f59e0b"),
+            ("📜", "JS Files", s["active_js_files"], f"{s['inactive_js_files']} inactive", "#10b981"),
+            ("🔍", "JS Findings", s["js_findings"], f"⚠ {s['critical_js_findings']} critical", "#ec4899"),
+            ("📡", "ASN IPs", s["alive_asn_ips"], f"{s['asn_ranges']} CIDR ranges", "#6366f1"),
         ]
         return f"""
-        <div class="summary-grid">
-            {"".join(f'''
-            <div class="summary-card">
-                <div class="card-icon">{icon}</div>
-                <div class="card-value">{value:,}</div>
-                <div class="card-label">{label}</div>
-                <div class="card-sub">{sub}</div>
-            </div>''' for icon, label, value, sub in cards)}
-        </div>"""
+        <section class="summary-section">
+            <div class="summary-grid">
+                {"".join(f'''
+                <div class="summary-card" style="--card-accent: {color}">
+                    <div class="card-icon">{icon}</div>
+                    <div class="card-value">{value:,}</div>
+                    <div class="card-label">{label}</div>
+                    <div class="card-sub">{sub}</div>
+                </div>''' for icon, label, value, sub, color in cards)}
+            </div>
+        </section>"""
 
-    def _severity_badges(self, counts: dict[str, int]) -> str:
-        badges = []
-        for sev in ["critical", "high", "medium", "low", "info"]:
+    def _severity_summary(self, counts: dict[str, int]) -> str:
+        parts = []
+        for sev in ["critical", "high", "medium", "low"]:
             if counts.get(sev, 0) > 0:
-                badges.append(
-                    f'<span class="sev-badge sev-{sev}">{counts[sev]}</span>'
-                )
-        return " ".join(badges)
+                parts.append(f'<span class="mini-sev sev-{sev}">{counts[sev]}</span>')
+        return " ".join(parts) if parts else "None"
 
     def _render_tabs(self) -> str:
         tabs = [
-            ("subdomains", "🌐 Subdomains", len(self.data.subdomains)),
-            ("urls", "🔗 URLs", len(self.data.httpx_results)),
-            ("ports", "🚪 Ports", len(self.data.port_results)),
-            ("vulns", "⚡ Vulnerabilities", len(self.data.nuclei_findings)),
-            ("katana", "🕷️ Katana", len(self.data.katana_urls)),
-            ("jsfiles", "📜 JS Files", len(self.data.js_files)),
-            ("jsfindings", "🔍 JS Findings", len(self.data.js_findings)),
-            ("asn", "📡 ASN", len(self.data.asn_ips)),
-            ("history", "📊 History", len(self.data.run_history)),
+            ("subdomains", "Subdomains", len(self.data.subdomains)),
+            ("urls", "URLs", len(self.data.httpx_results)),
+            ("ports", "Ports", len(self.data.port_results)),
+            ("vulns", "Vulns", len(self.data.nuclei_findings)),
+            ("katana", "Katana", len(self.data.katana_urls)),
+            ("jsfiles", "JS Files", len(self.data.js_files)),
+            ("jsfindings", "JS Findings", len(self.data.js_findings)),
+            ("asn", "ASN", len(self.data.asn_ips)),
+            ("history", "History", len(self.data.run_history)),
         ]
         return f"""
-        <div class="tabs-container">
-            <div class="tabs">
-                {"".join(f'<button class="tab" data-tab="{tid}" onclick="switchTab(\'{tid}\')">{label} <span class="tab-count">{count:,}</span></button>' for tid, label, count in tabs)}
+        <nav class="tabs-nav">
+            <div class="tabs-scroll">
+                {"".join(f'<button class="tab-btn" data-tab="{tid}" onclick="switchTab(\'{tid}\')">{label} <span class="tab-badge">{count:,}</span></button>' for tid, label, count in tabs)}
             </div>
-            <div class="tab-actions">
-                <input type="text" class="search-input" placeholder="Filter..." oninput="filterTable(this.value)">
-                <button class="btn btn-secondary" onclick="downloadCurrentTab()">📥 Download CSV</button>
-                <button class="btn btn-primary" onclick="downloadJSON()">📄 Download JSON</button>
+        </nav>"""
+
+    def _render_filter_panel(self) -> str:
+        status_codes = sorted(set(str(h.status_code) for h in self.data.httpx_results if h.status_code), key=lambda x: int(x) if x.isdigit() else 0)
+        severities = ["critical", "high", "medium", "low", "info"]
+        js_categories = sorted(set(jf.category for jf in self.data.js_findings))
+        
+        status_options = "".join(f'<option value="{self._esc(sc)}">{self._esc(sc)}</option>' for sc in status_codes[:30])
+        severity_options = "".join(f'<option value="{sev}">{sev.upper()}</option>' for sev in severities)
+        category_options = "".join(f'<option value="{self._esc(cat)}">{self._esc(cat)}</option>' for cat in js_categories[:20])
+        
+        return f"""
+        <div class="filter-panel" id="filterPanel">
+            <div class="filter-row">
+                <div class="filter-group">
+                    <label class="filter-label">🔍 Search</label>
+                    <input type="text" class="filter-input" id="searchInput" placeholder="Type to filter..." oninput="applyFilters()">
+                </div>
+                <div class="filter-group filter-status" id="filterStatusGroup" style="display:none">
+                    <label class="filter-label">Status</label>
+                    <select class="filter-select" id="filterStatus" onchange="applyFilters()">
+                        <option value="">All</option>
+                        <option value="alive">Alive</option>
+                        <option value="dead">Dead</option>
+                    </select>
+                </div>
+                <div class="filter-group filter-severity" id="filterSeverityGroup" style="display:none">
+                    <label class="filter-label">Severity</label>
+                    <select class="filter-select" id="filterSeverity" onchange="applyFilters()">
+                        <option value="">All</option>
+                        {severity_options}
+                    </select>
+                </div>
+                <div class="filter-group filter-statuscode" id="filterStatusCodeGroup" style="display:none">
+                    <label class="filter-label">Status Code</label>
+                    <select class="filter-select" id="filterStatusCode" onchange="applyFilters()">
+                        <option value="">All</option>
+                        {status_options}
+                    </select>
+                </div>
+                <div class="filter-group filter-category" id="filterCategoryGroup" style="display:none">
+                    <label class="filter-label">Category</label>
+                    <select class="filter-select" id="filterCategory" onchange="applyFilters()">
+                        <option value="">All</option>
+                        {category_options}
+                    </select>
+                </div>
+                <div class="filter-group filter-jsstatus" id="filterJsStatusGroup" style="display:none">
+                    <label class="filter-label">JS Status</label>
+                    <select class="filter-select" id="filterJsStatus" onchange="applyFilters()">
+                        <option value="">All</option>
+                        <option value="active">Active</option>
+                        <option value="inactive">Inactive</option>
+                    </select>
+                </div>
+                <div class="filter-actions">
+                    <button class="btn btn-sm btn-secondary" onclick="clearFilters()">Clear</button>
+                    <button class="btn btn-sm btn-primary" onclick="downloadCurrentCSV()">📥 CSV</button>
+                    <button class="btn btn-sm btn-secondary" onclick="copySelected()">📋 Copy</button>
+                </div>
+            </div>
+            <div class="filter-info" id="filterInfo">
+                <span id="rowCount">0 rows</span>
+                <div class="pagination-controls">
+                    <button class="btn btn-sm btn-outline" onclick="prevPage()">Prev</button>
+                    <span id="pageInfo">Page 1 of 1</span>
+                    <button class="btn btn-sm btn-outline" onclick="nextPage()">Next</button>
+                    <select class="filter-select" id="pageSize" onchange="changePageSize()" style="min-width: 80px; padding: 4px;">
+                        <option value="50">50 / page</option>
+                        <option value="100" selected>100 / page</option>
+                        <option value="500">500 / page</option>
+                        <option value="1000">1000 / page</option>
+                    </select>
+                </div>
+                <label class="select-all">
+                    <input type="checkbox" id="selectAll" onchange="toggleSelectAll(this.checked)">
+                    Select All
+                </label>
             </div>
         </div>"""
 
     def _render_tab_content(self) -> str:
         return f"""
-        <div class="tab-content">
-            <div id="tab-subdomains" class="tab-pane active">{self._render_subdomains_table()}</div>
-            <div id="tab-urls" class="tab-pane">{self._render_urls_table()}</div>
-            <div id="tab-ports" class="tab-pane">{self._render_ports_table()}</div>
-            <div id="tab-vulns" class="tab-pane">{self._render_vulns_table()}</div>
-            <div id="tab-katana" class="tab-pane">{self._render_katana_table()}</div>
-            <div id="tab-jsfiles" class="tab-pane">{self._render_jsfiles_table()}</div>
-            <div id="tab-jsfindings" class="tab-pane">{self._render_jsfindings_table()}</div>
-            <div id="tab-asn" class="tab-pane">{self._render_asn_table()}</div>
-            <div id="tab-history" class="tab-pane">{self._render_history_table()}</div>
-        </div>"""
+        <section class="table-section">
+            <div id="tab-subdomains" class="tab-pane active">{self._make_table("subdomains", ["", "Host", "Status", "Title", "Technology", "Ports", "Vulns", "Last Seen", ""])}</div>
+            <div id="tab-urls" class="tab-pane">{self._make_table("urls", ["", "URL", "Code", "Method", "Title", "Tech", "Server", "IP", "CDN", "Scanned"])}</div>
+            <div id="tab-ports" class="tab-pane">{self._make_table("ports", ["", "Subdomain", "Host", "IP", "Open Ports", "Scanned"])}</div>
+            <div id="tab-vulns" class="tab-pane">{self._make_table("vulns", ["", "Severity", "Host", "URL", "Name", "Template", "Found"])}</div>
+            <div id="tab-katana" class="tab-pane">{self._make_table("katana", ["", "URL", "Source", "Found"])}</div>
+            <div id="tab-jsfiles" class="tab-pane">{self._make_table("jsfiles", ["", "URL", "Source", "Size", "Hash", "Status", "Last Seen", "Changed"])}</div>
+            <div id="tab-jsfindings" class="tab-pane">{self._make_table("jsfindings", ["", "Category", "Value", "Type", "Source", "Context", "Status", "Last Seen"])}</div>
+            <div id="tab-asn" class="tab-pane">{self._make_table("asn", ["", "IP", "ASN", "CIDR", "Status", "Last Seen"])}</div>
+            <div id="tab-history" class="tab-pane">{self._make_table("history", ["Started", "Status", "Disc.", "New", "Live", "Vulns", "Katana", "JS Files", "JS Chg", "JS New", "JS Crit", "Finished"])}</div>
+        </section>"""
 
-    def _render_subdomains_table(self) -> str:
-        rows = []
-        for s in self.data.subdomains:
-            status_class = "alive" if s.alive else "dead"
-            status_text = f"{s.http_status or '—'}" if s.alive else "DEAD"
-            ports_str = ", ".join(s.ports[:5]) + (f" +{len(s.ports)-5}" if len(s.ports) > 5 else "")
-            tech_str = (s.http_tech or "")[:60]
-            rows.append(f"""
-            <tr>
-                <td><input type="checkbox" class="row-select" value="{escape(s.host)}"></td>
-                <td class="mono">{escape(s.host)}</td>
-                <td><span class="status-badge {status_class}">{status_text}</span></td>
-                <td class="truncate" title="{escape(s.http_title or '')}">{escape(s.http_title or '—')}</td>
-                <td class="truncate" title="{escape(tech_str)}">{escape(tech_str) or '—'}</td>
-                <td class="mono">{escape(ports_str) or '—'}</td>
-                <td>{f'<span class="vuln-count">{s.nuclei_count}</span>' if s.nuclei_count > 0 else '—'}</td>
-                <td class="date">{escape(s.last_seen[:10])}</td>
-                <td>{f'<a href="{escape(s.http_url)}" target="_blank" class="link">↗</a>' if s.http_url else '—'}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "Host", "Status", "Title", "Technology", "Ports", "Vulns", "Last Seen", ""],
-            rows,
-            "subdomains"
-        )
-
-    def _render_urls_table(self) -> str:
-        rows = []
-        for h in self.data.httpx_results:
-            tech = (h.tech or "")[:50]
-            rows.append(f"""
-            <tr>
-                <td><input type="checkbox" class="row-select" value="{escape(h.url or '')}"></td>
-                <td class="mono truncate">{escape(h.url or '—')}</td>
-                <td><span class="status-badge {'alive' if h.status_code and h.status_code < 400 else 'dead'}">{h.status_code or '—'}</span></td>
-                <td class="truncate">{escape(h.method or '—')}</td>
-                <td class="truncate">{escape(h.title or '—')}</td>
-                <td class="truncate" title="{escape(tech)}">{escape(tech) or '—'}</td>
-                <td class="mono">{escape(h.webserver or '—')}</td>
-                <td class="mono">{escape(h.host_ip or '—')}</td>
-                <td>{f'<span class="cdn-badge">{escape(h.cdn_name)}</span>' if h.cdn_name else '—'}</td>
-                <td class="date">{escape(h.scanned_at[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "URL", "Status", "Method", "Title", "Tech", "Server", "IP", "CDN", "Scanned"],
-            rows,
-            "urls"
-        )
-
-    def _render_ports_table(self) -> str:
-        rows = []
-        for p in self.data.port_results:
-            ports = p.open_ports.split(",")
-            port_badges = " ".join(f'<span class="port-badge">{escape(port.strip())}</span>' for port in ports[:10])
-            if len(ports) > 10:
-                port_badges += f'<span class="port-badge more">+{len(ports)-10}</span>'
-            rows.append(f"""
-            <tr>
-                <td><input type="checkbox" class="row-select" value="{escape(p.subdomain)}"></td>
-                <td class="mono">{escape(p.subdomain)}</td>
-                <td class="mono">{escape(p.host or p.subdomain)}</td>
-                <td class="mono">{escape(p.ip or '—')}</td>
-                <td><div class="port-list">{port_badges}</div></td>
-                <td class="date">{escape(p.scanned_at[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "Subdomain", "Host", "IP", "Open Ports", "Scanned"],
-            rows,
-            "ports"
-        )
-
-    def _render_vulns_table(self) -> str:
-        rows = []
-        for n in self.data.nuclei_findings:
-            sev = (n.severity or "unknown").lower()
-            rows.append(f"""
-            <tr class="vuln-row sev-{sev}">
-                <td><input type="checkbox" class="row-select" value="{escape(n.url or n.subdomain)}"></td>
-                <td><span class="sev-badge sev-{sev}">{escape(n.severity or 'unknown').upper()}</span></td>
-                <td class="mono truncate">{escape(n.subdomain)}</td>
-                <td class="mono truncate">{escape(n.url or '—')}</td>
-                <td class="truncate">{escape(n.name or '—')}</td>
-                <td class="mono truncate">{escape(n.template_id or '—')}</td>
-                <td class="date">{escape(n.scanned_at[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "Severity", "Host", "URL", "Name", "Template", "Found"],
-            rows,
-            "vulns"
-        )
-
-    def _render_katana_table(self) -> str:
-        rows = []
-        for k in self.data.katana_urls:
-            rows.append(f"""
-            <tr>
-                <td><input type="checkbox" class="row-select" value="{escape(k.url)}"></td>
-                <td class="mono truncate">{escape(k.url)}</td>
-                <td class="mono">{escape(k.subdomain)}</td>
-                <td class="date">{escape(k.scanned_at[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "URL", "Source", "Found"],
-            rows,
-            "katana"
-        )
-
-    def _render_jsfiles_table(self) -> str:
-        rows = []
-        for j in self.data.js_files:
-            active_class = "active" if j.is_active else "inactive"
-            rows.append(f"""
-            <tr class="{active_class}">
-                <td><input type="checkbox" class="row-select" value="{escape(j.url)}"></td>
-                <td class="mono truncate">{escape(j.url)}</td>
-                <td class="mono truncate">{escape(j.source_url or '—')}</td>
-                <td>{j.content_length or '—'}</td>
-                <td class="mono hash">{escape((j.current_hash or '')[:12])}…</td>
-                <td><span class="status-badge {active_class}">{'Active' if j.is_active else 'Inactive'}</span></td>
-                <td class="date">{escape(j.last_seen_at[:10])}</td>
-                <td class="date">{escape((j.last_changed_at or j.first_seen_at)[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "URL", "Source", "Size", "Hash", "Status", "Last Seen", "Changed"],
-            rows,
-            "jsfiles"
-        )
-
-    def _render_jsfindings_table(self) -> str:
-        rows = []
-        for jf in self.data.js_findings:
-            is_critical = jf.category in self.CRITICAL_JS_CATEGORIES
-            crit_class = "critical-finding" if is_critical else ""
-            value_display = jf.value[:100] + ("…" if len(jf.value) > 100 else "")
-            rows.append(f"""
-            <tr class="{crit_class} {'inactive' if not jf.is_active else ''}">
-                <td><input type="checkbox" class="row-select" value="{escape(jf.value)}"></td>
-                <td><span class="category-badge {'critical-cat' if is_critical else ''}">{escape(jf.category)}</span></td>
-                <td class="mono truncate" title="{escape(jf.value)}">{escape(value_display)}</td>
-                <td class="truncate">{escape(jf.source_type)}</td>
-                <td class="mono truncate">{escape(jf.source_url or '—')}</td>
-                <td class="truncate context" title="{escape(jf.context or '')}">{escape((jf.context or '')[:60]) or '—'}</td>
-                <td><span class="status-badge {'active' if jf.is_active else 'inactive'}">{'Active' if jf.is_active else 'Old'}</span></td>
-                <td class="date">{escape(jf.last_seen_at[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "Category", "Value", "Source Type", "Source URL", "Context", "Status", "Last Seen"],
-            rows,
-            "jsfindings"
-        )
-
-    def _render_asn_table(self) -> str:
-        # Combine ranges and IPs
-        rows = []
-        for a in self.data.asn_ips:
-            rows.append(f"""
-            <tr class="{'alive' if a.alive else 'dead'}">
-                <td><input type="checkbox" class="row-select" value="{escape(a.ip)}"></td>
-                <td class="mono">{escape(a.ip)}</td>
-                <td class="mono">{escape(a.asn or '—')}</td>
-                <td class="mono">{escape(a.cidr or '—')}</td>
-                <td><span class="status-badge {'alive' if a.alive else 'dead'}">{'Alive' if a.alive else 'Dead'}</span></td>
-                <td class="date">{escape(a.last_seen[:10])}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["", "IP", "ASN", "CIDR", "Status", "Last Seen"],
-            rows,
-            "asn"
-        )
-
-    def _render_history_table(self) -> str:
-        rows = []
-        for r in self.data.run_history:
-            status_class = "success" if r.status == "ok" else "warning" if r.status == "running" else "error"
-            rows.append(f"""
-            <tr>
-                <td class="date">{escape(r.started_at[:19].replace('T', ' '))}</td>
-                <td><span class="status-badge {status_class}">{escape(r.status)}</span></td>
-                <td>{r.discovered:,}</td>
-                <td>{r.new_subdomains:,}</td>
-                <td>{r.live_subdomains:,}</td>
-                <td><span class="vuln-count">{r.nuclei_findings:,}</span></td>
-                <td>{r.katana_urls:,}</td>
-                <td>{r.js_files_found:,}</td>
-                <td>{r.js_files_changed:,}</td>
-                <td>{r.js_findings_new:,}</td>
-                <td><span class="critical-count">{r.js_findings_critical:,}</span></td>
-                <td class="date">{escape((r.finished_at or '')[:19].replace('T', ' ') if r.finished_at else '—')}</td>
-            </tr>""")
-        return self._table_wrapper(
-            ["Started", "Status", "Discovered", "New Subs", "Live", "Vulns", "Katana", "JS Files", "JS Changed", "JS New", "JS Critical", "Finished"],
-            rows,
-            "history"
-        )
-
-    def _table_wrapper(self, headers: list[str], rows: list[str], table_id: str) -> str:
-        header_row = "".join(f"<th>{h}</th>" for h in headers)
-        selection_ui = f"""
-        <div class="table-toolbar" id="toolbar-{table_id}">
-            <label class="select-all-label">
-                <input type="checkbox" onchange="toggleSelectAll('{table_id}', this.checked)">
-                Select All
-            </label>
-            <button class="btn btn-small" onclick="downloadSelected('{table_id}')">📥 Download Selected</button>
-            <button class="btn btn-small" onclick="copySelected('{table_id}')">📋 Copy Selected</button>
-            <span class="row-count" id="count-{table_id}">{len(rows):,} rows</span>
-        </div>"""
+    def _make_table(self, tab_id: str, headers: list[str]) -> str:
+        th = "".join(f"<th>{h}</th>" for h in headers)
         return f"""
-        {selection_ui}
-        <div class="table-container">
-            <table id="table-{table_id}">
-                <thead><tr>{header_row}</tr></thead>
-                <tbody>{"".join(rows)}</tbody>
+        <div class="table-wrap">
+            <table>
+                <thead><tr>{th}</tr></thead>
+                <tbody id="tbody-{tab_id}"></tbody>
             </table>
         </div>"""
 
     def _get_css(self) -> str:
         return """
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        
         :root {
-            --bg-primary: #0f172a;
-            --bg-secondary: #1e293b;
-            --bg-tertiary: #334155;
-            --text-primary: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --text-muted: #64748b;
+            --bg-base: #0a0e1a;
+            --bg-surface: #111827;
+            --bg-elevated: #1f2937;
+            --bg-hover: #374151;
+            --border: #1f2937;
+            --border-light: #374151;
+            --text-primary: #f9fafb;
+            --text-secondary: #9ca3af;
+            --text-muted: #6b7280;
             --accent: #3b82f6;
             --accent-hover: #2563eb;
-            --border: #334155;
-            --success: #22c55e;
-            --warning: #eab308;
-            --error: #ef4444;
-            --radius: 8px;
-            --shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
+            --green: #22c55e;
+            --red: #ef4444;
+            --orange: #f97316;
+            --yellow: #eab308;
+            --purple: #a855f7;
+            --pink: #ec4899;
+            --cyan: #06b6d4;
+            --radius: 6px;
+            --radius-lg: 10px;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        html { font-size: 14px; }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-            background: var(--bg-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-base);
             color: var(--text-primary);
-            line-height: 1.6;
+            line-height: 1.5;
             min-height: 100vh;
         }
-        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
         
         /* Header */
         .header {
-            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
-            border-radius: var(--radius);
-            padding: 24px;
-            margin-bottom: 24px;
-            border: 1px solid var(--border);
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
-        .header h1 { font-size: 1.8rem; margin-bottom: 8px; }
-        .program-info { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; }
-        .program-name { font-size: 1.3rem; font-weight: 600; color: var(--accent); }
-        .export-time { color: var(--text-muted); font-size: 0.9rem; }
-        .scope-tags { display: flex; flex-wrap: wrap; gap: 8px; }
-        .scope-tag {
-            background: var(--bg-primary);
-            padding: 4px 12px;
+        .header-inner {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .header-left { display: flex; flex-direction: column; gap: 6px; }
+        .header-title { font-size: 1.4rem; font-weight: 700; }
+        .header-meta { display: flex; align-items: center; gap: 12px; }
+        .program-badge {
+            background: linear-gradient(135deg, var(--accent), var(--purple));
+            color: white;
+            padding: 2px 12px;
             border-radius: 20px;
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            border: 1px solid var(--border);
+            font-weight: 600;
+            font-size: 0.9rem;
         }
-        .scope-tag.more { color: var(--text-muted); font-style: italic; }
+        .export-time { color: var(--text-muted); font-size: 0.85rem; }
+        .header-actions { display: flex; gap: 8px; }
+        .scope-bar {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 8px 24px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .scope-label { color: var(--text-muted); font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
+        .scope-tag {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-light);
+            color: var(--text-secondary);
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-size: 0.78rem;
+        }
+        .scope-more { color: var(--text-muted); font-style: italic; }
+        
+        /* Main Container */
+        .main-container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px 24px;
+        }
         
         /* Summary Cards */
         .summary-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 20px;
         }
         .summary-card {
-            background: var(--bg-secondary);
-            border-radius: var(--radius);
-            padding: 20px;
+            background: var(--bg-surface);
             border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 16px;
             text-align: center;
-            transition: transform 0.2s, box-shadow 0.2s;
+            border-top: 3px solid var(--card-accent, var(--accent));
+            transition: transform 0.15s ease;
         }
-        .summary-card:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow);
-        }
-        .card-icon { font-size: 1.5rem; margin-bottom: 8px; }
-        .card-value { font-size: 2rem; font-weight: 700; color: var(--text-primary); }
-        .card-label { font-size: 0.9rem; color: var(--text-secondary); margin-top: 4px; }
-        .card-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 8px; }
-        
-        /* Severity Badges */
-        .sev-badge {
+        .summary-card:hover { transform: translateY(-2px); }
+        .card-icon { font-size: 1.3rem; margin-bottom: 6px; }
+        .card-value { font-size: 1.8rem; font-weight: 800; line-height: 1.2; }
+        .card-label { font-size: 0.85rem; color: var(--text-secondary); margin-top: 2px; }
+        .card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 8px; line-height: 1.4; }
+        .mini-sev {
             display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            margin: 0 1px;
         }
-        .sev-critical { background: rgba(220,38,38,0.2); color: #fca5a5; border: 1px solid #dc2626; }
-        .sev-high { background: rgba(234,88,12,0.2); color: #fdba74; border: 1px solid #ea580c; }
-        .sev-medium { background: rgba(202,138,4,0.2); color: #fde047; border: 1px solid #ca8a04; }
-        .sev-low { background: rgba(37,99,235,0.2); color: #93c5fd; border: 1px solid #2563eb; }
-        .sev-info, .sev-unknown { background: rgba(107,114,128,0.2); color: #d1d5db; border: 1px solid #6b7280; }
+        .mini-sev.sev-critical { background: rgba(239,68,68,0.3); color: #fca5a5; }
+        .mini-sev.sev-high { background: rgba(249,115,22,0.3); color: #fdba74; }
+        .mini-sev.sev-medium { background: rgba(234,179,8,0.3); color: #fde047; }
+        .mini-sev.sev-low { background: rgba(59,130,246,0.3); color: #93c5fd; }
         
         /* Tabs */
-        .tabs-container {
-            background: var(--bg-secondary);
-            border-radius: var(--radius);
+        .tabs-nav {
+            background: var(--bg-surface);
             border: 1px solid var(--border);
-            margin-bottom: 24px;
+            border-radius: var(--radius-lg) var(--radius-lg) 0 0;
             overflow: hidden;
         }
-        .tabs {
+        .tabs-scroll {
             display: flex;
             overflow-x: auto;
-            border-bottom: 1px solid var(--border);
-            scrollbar-width: thin;
+            scrollbar-width: none;
         }
-        .tabs::-webkit-scrollbar { height: 4px; }
-        .tabs::-webkit-scrollbar-track { background: var(--bg-secondary); }
-        .tabs::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 2px; }
-        .tab {
+        .tabs-scroll::-webkit-scrollbar { display: none; }
+        .tab-btn {
             background: none;
             border: none;
+            border-bottom: 2px solid transparent;
             color: var(--text-secondary);
-            padding: 14px 20px;
+            padding: 12px 20px;
             cursor: pointer;
             font-size: 0.9rem;
             white-space: nowrap;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
+            transition: all 0.15s ease;
         }
-        .tab:hover { color: var(--text-primary); background: var(--bg-tertiary); }
-        .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-        .tab-count {
-            background: var(--bg-tertiary);
-            padding: 1px 8px;
+        .tab-btn:hover { color: var(--text-primary); background: var(--bg-elevated); }
+        .tab-btn.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+            background: var(--bg-elevated);
+        }
+        .tab-badge {
+            background: var(--bg-base);
+            padding: 1px 7px;
             border-radius: 10px;
             font-size: 0.75rem;
             margin-left: 6px;
         }
-        .tab.active .tab-count { background: rgba(59,130,246,0.3); }
-        .tab-actions {
+        .tab-btn.active .tab-badge { background: rgba(59,130,246,0.2); color: var(--accent); }
+        
+        /* Filter Panel */
+        .filter-panel {
+            background: var(--bg-surface);
+            border-left: 1px solid var(--border);
+            border-right: 1px solid var(--border);
+            padding: 12px 16px;
+        }
+        .filter-row {
+            display: flex;
+            align-items: flex-end;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+        .filter-group { display: flex; flex-direction: column; gap: 4px; }
+        .filter-label { font-size: 0.75rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; }
+        .filter-input, .filter-select {
+            background: var(--bg-base);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius);
+            padding: 7px 10px;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            min-width: 160px;
+        }
+        .filter-input { min-width: 250px; flex: 1; max-width: 400px; }
+        .filter-input:focus, .filter-select:focus { outline: none; border-color: var(--accent); }
+        .filter-actions { display: flex; gap: 8px; margin-left: auto; align-items: flex-end; }
+        .filter-info {
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 12px 16px;
+            justify-content: space-between;
+            padding-top: 8px;
             border-top: 1px solid var(--border);
+            gap: 10px;
         }
-        .search-input {
-            flex: 1;
-            background: var(--bg-primary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 8px 12px;
-            color: var(--text-primary);
-            font-size: 0.9rem;
+        #rowCount { color: var(--text-muted); font-size: 0.8rem; min-width: 100px; }
+        
+        .pagination-controls { display: flex; align-items: center; gap: 8px; flex: 1; justify-content: center; }
+        #pageInfo { font-size: 0.85rem; color: var(--text-secondary); min-width: 100px; text-align: center; }
+        
+        .select-all {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            cursor: pointer;
+            min-width: 100px;
+            justify-content: flex-end;
         }
-        .search-input:focus { outline: none; border-color: var(--accent); }
         
         /* Buttons */
         .btn {
-            padding: 8px 16px;
-            border-radius: 4px;
-            border: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 7px 14px;
+            border-radius: var(--radius);
+            border: 1px solid transparent;
             cursor: pointer;
             font-size: 0.85rem;
             font-weight: 500;
-            transition: all 0.2s;
+            transition: all 0.15s ease;
             white-space: nowrap;
         }
-        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
         .btn-primary:hover { background: var(--accent-hover); }
-        .btn-secondary { background: var(--bg-tertiary); color: var(--text-primary); }
-        .btn-secondary:hover { background: var(--border); }
-        .btn-small { padding: 4px 12px; font-size: 0.8rem; }
+        .btn-secondary { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-light); }
+        .btn-secondary:hover { background: var(--bg-hover); }
+        .btn-outline { background: transparent; color: var(--text-secondary); border-color: var(--border-light); }
+        .btn-outline:hover { background: var(--bg-elevated); color: var(--text-primary); }
+        .btn-sm { padding: 5px 10px; font-size: 0.8rem; }
         
-        /* Tab Content */
+        /* Table Section */
+        .table-section {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-top: none;
+            border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+            overflow: hidden;
+        }
         .tab-pane { display: none; }
         .tab-pane.active { display: block; }
         
-        /* Table Toolbar */
-        .table-toolbar {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            padding: 12px 16px;
-            background: var(--bg-secondary);
-            border-radius: var(--radius) var(--radius) 0 0;
-            border: 1px solid var(--border);
-            border-bottom: none;
-        }
-        .select-all-label {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            cursor: pointer;
-        }
-        .row-count { margin-left: auto; color: var(--text-muted); font-size: 0.85rem; }
-        
-        /* Tables */
-        .table-container {
+        .table-wrap {
             overflow-x: auto;
-            border: 1px solid var(--border);
-            border-radius: 0 0 var(--radius) var(--radius);
-            max-height: 70vh;
+            max-height: calc(100vh - 380px);
             overflow-y: auto;
         }
+        .table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+        .table-wrap::-webkit-scrollbar-track { background: var(--bg-surface); }
+        .table-wrap::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 4px; }
+        .table-wrap::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.85rem;
+            font-size: 0.82rem;
         }
-        th, td {
-            padding: 10px 12px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
+        thead { position: sticky; top: 0; z-index: 10; }
         th {
-            background: var(--bg-tertiary);
+            background: var(--bg-elevated);
             color: var(--text-secondary);
             font-weight: 600;
-            position: sticky;
-            top: 0;
-            z-index: 10;
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
         }
-        tr:hover { background: rgba(59,130,246,0.05); }
-        .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; }
-        .truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .date { white-space: nowrap; color: var(--text-muted); }
-        .hash { color: var(--text-muted); }
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+        }
+        tr:hover td { background: rgba(59,130,246,0.04); }
+        tr.row-hidden { display: none; }
+        tr.row-inactive { opacity: 0.55; }
+        tr.row-critical { background: rgba(239,68,68,0.06); }
+        tr.vuln-row-critical { border-left: 3px solid var(--red); }
+        tr.vuln-row-high { border-left: 3px solid var(--orange); }
         
-        /* Status Badges */
-        .status-badge {
+        /* Cell Types */
+        .td-check { width: 36px; text-align: center; }
+        .td-host, .td-url, .td-ip { min-width: 200px; }
+        .td-status { width: 90px; }
+        .td-title { max-width: 200px; }
+        .td-tech { max-width: 180px; }
+        .td-ports { min-width: 150px; }
+        .td-vulns { width: 50px; text-align: center; }
+        .td-date { width: 100px; white-space: nowrap; color: var(--text-muted); }
+        .td-link { width: 30px; text-align: center; }
+        .td-method { width: 60px; }
+        .td-server { width: 80px; }
+        .td-cdn { width: 80px; }
+        .td-severity { width: 80px; }
+        .td-name { max-width: 250px; }
+        .td-template { max-width: 150px; }
+        .td-size { width: 70px; text-align: right; }
+        .td-hash { width: 100px; }
+        .td-category { width: 100px; }
+        .td-value { max-width: 300px; }
+        .td-type { width: 80px; }
+        .td-context { max-width: 200px; font-style: italic; color: var(--text-muted); }
+        .td-asn, .td-cidr { width: 120px; }
+        .td-num { text-align: right; font-variant-numeric: tabular-nums; }
+        .td-vuln-highlight { color: #fca5a5; font-weight: 600; }
+        .td-crit-highlight { color: #fca5a5; font-weight: 700; }
+        
+        /* Text Styles */
+        .mono-text { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace; font-size: 0.8rem; }
+        .text-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+        
+        /* Status Pills */
+        .status-pill {
             display: inline-block;
             padding: 2px 8px;
             border-radius: 4px;
             font-size: 0.75rem;
-            font-weight: 500;
+            font-weight: 600;
+            text-align: center;
+            min-width: 45px;
         }
-        .status-badge.alive, .status-badge.active, .status-badge.success {
-            background: rgba(34,197,94,0.15);
-            color: #86efac;
-            border: 1px solid #22c55e;
-        }
-        .status-badge.dead, .status-badge.inactive, .status-badge.error {
-            background: rgba(239,68,68,0.15);
-            color: #fca5a5;
-            border: 1px solid #ef4444;
-        }
-        .status-badge.warning {
-            background: rgba(234,179,8,0.15);
-            color: #fde047;
-            border: 1px solid #eab308;
-        }
+        .status-alive, .status-2xx, .status-active, .status-ok { background: rgba(34,197,94,0.15); color: #86efac; }
+        .status-dead, .status-5xx, .status-inactive, .status-error { background: rgba(239,68,68,0.15); color: #fca5a5; }
+        .status-3xx { background: rgba(59,130,246,0.15); color: #93c5fd; }
+        .status-4xx { background: rgba(249,115,22,0.15); color: #fdba74; }
+        .status-running { background: rgba(234,179,8,0.15); color: #fde047; }
         
-        /* Special Elements */
-        .vuln-count {
-            background: rgba(220,38,38,0.2);
-            color: #fca5a5;
+        /* Severity Pills */
+        .sev-pill {
+            display: inline-block;
             padding: 2px 8px;
             border-radius: 4px;
-            font-weight: 600;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
         }
-        .critical-count {
-            background: rgba(220,38,38,0.3);
+        .sev-critical { background: rgba(239,68,68,0.2); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4); }
+        .sev-high { background: rgba(249,115,22,0.2); color: #fdba74; border: 1px solid rgba(249,115,22,0.4); }
+        .sev-medium { background: rgba(234,179,8,0.2); color: #fde047; border: 1px solid rgba(234,179,8,0.4); }
+        .sev-low { background: rgba(59,130,246,0.2); color: #93c5fd; border: 1px solid rgba(59,130,246,0.4); }
+        .sev-info, .sev-unknown { background: rgba(107,114,128,0.2); color: #d1d5db; border: 1px solid rgba(107,114,128,0.4); }
+        
+        /* Port Tags */
+        .port-tag {
+            display: inline-block;
+            background: var(--bg-base);
+            border: 1px solid var(--border-light);
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 0.72rem;
+            font-family: monospace;
+            margin: 1px;
+        }
+        .port-more { color: var(--text-muted); font-style: italic; border-style: dashed; }
+        .port-list { display: flex; flex-wrap: wrap; gap: 2px; }
+        
+        /* Vuln/CDN Tags */
+        .vuln-badge {
+            background: rgba(239,68,68,0.2);
             color: #fca5a5;
-            padding: 2px 8px;
+            padding: 2px 6px;
             border-radius: 4px;
             font-weight: 700;
+            font-size: 0.8rem;
         }
-        .port-badge {
-            display: inline-block;
-            background: var(--bg-tertiary);
+        .cdn-tag {
+            background: rgba(168,85,247,0.2);
+            color: #d8b4fe;
             padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 0.75rem;
-            margin: 2px;
-            font-family: monospace;
-        }
-        .port-badge.more { color: var(--text-muted); font-style: italic; }
-        .port-list { display: flex; flex-wrap: wrap; gap: 2px; }
-        .cdn-badge {
-            background: rgba(139,92,246,0.2);
-            color: #c4b5fd;
-            padding: 2px 8px;
             border-radius: 4px;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
         }
-        .category-badge {
+        .cat-pill {
             display: inline-block;
-            background: var(--bg-tertiary);
+            background: var(--bg-base);
+            border: 1px solid var(--border-light);
             padding: 2px 8px;
             border-radius: 4px;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             font-weight: 500;
         }
-        .category-badge.critical-cat {
-            background: rgba(220,38,38,0.2);
+        .cat-critical {
+            background: rgba(239,68,68,0.2);
             color: #fca5a5;
-            border: 1px solid #dc2626;
+            border-color: rgba(239,68,68,0.4);
+            font-weight: 700;
         }
-        .link {
+        
+        .ext-link {
             color: var(--accent);
             text-decoration: none;
-            font-weight: bold;
+            font-size: 1.1rem;
         }
-        .link:hover { text-decoration: underline; }
-        .context { font-style: italic; color: var(--text-muted); }
-        tr.critical-finding { background: rgba(220,38,38,0.05); }
-        tr.inactive { opacity: 0.6; }
-        tr.vuln-row.sev-critical { border-left: 3px solid #dc2626; }
-        tr.vuln-row.sev-high { border-left: 3px solid #ea580c; }
+        .ext-link:hover { color: var(--accent-hover); }
         
-        /* Checkbox Styling */
+        /* Checkbox */
         input[type="checkbox"] {
-            width: 16px;
-            height: 16px;
+            width: 14px;
+            height: 14px;
             cursor: pointer;
             accent-color: var(--accent);
         }
         
         /* Responsive */
-        @media (max-width: 768px) {
-            .container { padding: 12px; }
-            .header h1 { font-size: 1.4rem; }
-            .summary-grid { grid-template-columns: repeat(2, 1fr); }
-            .tab-actions { flex-wrap: wrap; }
-            .search-input { width: 100%; order: -1; }
-            .table-toolbar { flex-wrap: wrap; }
+        @media (max-width: 1024px) {
+            .main-container { padding: 16px; }
+            .summary-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+            .filter-row { flex-direction: column; align-items: stretch; }
+            .filter-input { max-width: 100%; min-width: 100%; }
+            .filter-actions { margin-left: 0; }
+            .td-host, .td-url { min-width: 150px; }
         }
-        
-        /* Hidden rows for filtering */
-        tr.hidden { display: none; }
+        @media (max-width: 640px) {
+            .header-inner { padding: 12px 16px; }
+            .header-title { font-size: 1.1rem; }
+            .scope-bar { padding: 8px 16px 10px; }
+            .main-container { padding: 12px; }
+            .summary-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+            .summary-card { padding: 12px; }
+            .card-value { font-size: 1.4rem; }
+            .tab-btn { padding: 10px 14px; font-size: 0.82rem; }
+            .pagination-controls { flex-wrap: wrap; }
+        }
         """
 
     def _get_js(self) -> str:
         return f"""
-        const reportData = {json.dumps(self.data.to_dict(), default=str, ensure_ascii=False)};
-        
+        const DATA = JSON.parse(document.getElementById('recon-data').textContent);
         let currentTab = 'subdomains';
+        let currentPage = 1;
+        let pageSize = 100;
+        let filteredData = [];
         
+        // Escape HTML to prevent XSS
+        function esc(str) {{
+            if (str === null || str === undefined) return '';
+            return String(str).replace(/[&<>'"]/g, 
+                tag => ({{
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                }}[tag] || tag));
+        }}
+
+        // Tab switching
         function switchTab(tabId) {{
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
             document.querySelector(`[data-tab="${{tabId}}"]`).classList.add('active');
             document.getElementById(`tab-${{tabId}}`).classList.add('active');
             currentTab = tabId;
+            currentPage = 1;
+            updateFilterVisibility();
+            applyFilters();
         }}
         
-        function filterTable(query) {{
-            query = query.toLowerCase().trim();
-            const table = document.getElementById(`table-${{currentTab}}`);
-            if (!table) return;
-            
-            const rows = table.querySelectorAll('tbody tr');
-            let visible = 0;
-            
-            rows.forEach(row => {{
-                const text = row.textContent.toLowerCase();
-                const isHidden = query && !text.includes(query);
-                row.classList.toggle('hidden', isHidden);
-                if (!isHidden) visible++;
+        // Show/hide relevant filters
+        function updateFilterVisibility() {{
+            const groups = {{
+                'subdomains': ['filterStatusGroup'],
+                'urls': ['filterStatusCodeGroup'],
+                'vulns': ['filterSeverityGroup'],
+                'jsfiles': ['filterJsStatusGroup'],
+                'jsfindings': ['filterCategoryGroup', 'filterJsStatusGroup'],
+                'asn': ['filterStatusGroup'],
+            }};
+            const allGroups = ['filterStatusGroup', 'filterSeverityGroup', 'filterStatusCodeGroup', 'filterCategoryGroup', 'filterJsStatusGroup'];
+            allGroups.forEach(id => {{
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'none';
             }});
-            
-            const countEl = document.getElementById(`count-${{currentTab}}`);
-            if (countEl) {{
-                countEl.textContent = `${{visible.toLocaleString()}} rows` + (query ? ` (filtered from ${{rows.length.toLocaleString()}})` : '');
-            }}
+            (groups[currentTab] || []).forEach(id => {{
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'flex';
+            }});
         }}
         
-        function toggleSelectAll(tableId, checked) {{
-            const table = document.getElementById(`table-${{tableId}}`);
-            if (!table) return;
-            table.querySelectorAll('.row-select:not(:disabled)').forEach(cb => {{
-                if (!cb.closest('tr').classList.contains('hidden')) {{
-                    cb.checked = checked;
+        // Apply all filters on the data array directly
+        function applyFilters() {{
+            const search = document.getElementById('searchInput').value.toLowerCase().trim();
+            const status = getFilterVal('filterStatus');
+            const severity = getFilterVal('filterSeverity');
+            const statusCode = getFilterVal('filterStatusCode');
+            const category = getFilterVal('filterCategory');
+            const jsStatus = getFilterVal('filterJsStatus');
+            
+            let dataset = [];
+            if (currentTab === 'subdomains') dataset = DATA.subdomains;
+            else if (currentTab === 'urls') dataset = DATA.httpx_results;
+            else if (currentTab === 'ports') dataset = DATA.port_results;
+            else if (currentTab === 'vulns') dataset = DATA.nuclei_findings;
+            else if (currentTab === 'katana') dataset = DATA.katana_urls;
+            else if (currentTab === 'jsfiles') dataset = DATA.js_files;
+            else if (currentTab === 'jsfindings') dataset = DATA.js_findings;
+            else if (currentTab === 'asn') dataset = DATA.asn_ips;
+            else if (currentTab === 'history') dataset = DATA.run_history;
+
+            filteredData = dataset.filter(row => {{
+                // Quick global text search on values
+                if (search) {{
+                    const rowText = Object.values(row).join(' ').toLowerCase();
+                    if (!rowText.includes(search)) return false;
+                }}
+                
+                // Status filter (subdomains, asn)
+                if (status) {{
+                    const isAlive = row.alive === true;
+                    if (status === 'alive' && !isAlive) return false;
+                    if (status === 'dead' && isAlive) return false;
+                }}
+                
+                // Severity filter (vulns)
+                if (severity && row.severity) {{
+                    if ((row.severity||'').toLowerCase() !== severity) return false;
+                }}
+                
+                // Status code filter (urls)
+                if (statusCode && row.status_code) {{
+                    if (String(row.status_code) !== statusCode) return false;
+                }}
+                
+                // Category filter (js findings)
+                if (category && row.category) {{
+                    if (row.category !== category) return false;
+                }}
+                
+                // JS status filter
+                if (jsStatus && row.is_active !== undefined) {{
+                    const isActive = row.is_active === true;
+                    if (jsStatus === 'active' && !isActive) return false;
+                    if (jsStatus === 'inactive' && isActive) return false;
+                }}
+                
+                return true;
+            }});
+
+            currentPage = 1;
+            renderTable();
+        }}
+        
+        function renderTable() {{
+            const tbody = document.getElementById(`tbody-${{currentTab}}`);
+            if (!tbody) return;
+            
+            const totalRows = filteredData.length;
+            const totalPages = Math.ceil(totalRows / pageSize) || 1;
+            if (currentPage > totalPages) currentPage = totalPages;
+            
+            const startIdx = (currentPage - 1) * pageSize;
+            const endIdx = Math.min(startIdx + pageSize, totalRows);
+            const pageData = filteredData.slice(startIdx, endIdx);
+            
+            let html = '';
+            
+            pageData.forEach(row => {{
+                if (currentTab === 'subdomains') {{
+                    const statusStr = row.http_status ? String(row.http_status) : (row.alive ? "ALIVE" : "DEAD");
+                    let statusClass = row.alive ? "status-alive" : "status-dead";
+                    if (row.http_status) {{
+                        if (row.http_status < 300) statusClass = "status-2xx";
+                        else if (row.http_status < 400) statusClass = "status-3xx";
+                        else if (row.http_status < 500) statusClass = "status-4xx";
+                        else statusClass = "status-5xx";
+                    }}
+                    let portsHtml = (row.ports || []).slice(0, 4).map(p => `<span class="port-tag">${{esc(p)}}</span>`).join('');
+                    if ((row.ports || []).length > 4) portsHtml += `<span class="port-tag port-more">+${{row.ports.length - 4}}</span>`;
+                    const vulnsHtml = row.nuclei_count ? `<span class="vuln-badge">${{row.nuclei_count}}</span>` : '—';
+                    const linkHtml = row.http_url ? `<a href="${{esc(row.http_url)}}" target="_blank" class="ext-link" title="${{esc(row.http_url)}}">↗</a>` : '';
+                    
+                    html += `<tr data-status="${{row.alive ? 'alive' : 'dead'}}">
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.host)}}"></td>
+                        <td class="td-host"><span class="mono-text">${{esc(row.host)}}</span></td>
+                        <td class="td-status"><span class="status-pill ${{statusClass}}">${{esc(statusStr)}}</span></td>
+                        <td class="td-title" title="${{esc(row.http_title)}}">${{esc((row.http_title||'').substring(0,50)) || (row.http_title ? '' : '—')}}</td>
+                        <td class="td-tech" title="${{esc(row.http_tech)}}">${{esc((row.http_tech||'').substring(0,40)) || (row.http_tech ? '' : '—')}}</td>
+                        <td class="td-ports">${{portsHtml || '—'}}</td>
+                        <td class="td-vulns">${{vulnsHtml}}</td>
+                        <td class="td-date">${{esc((row.last_seen||'').substring(0,10))}}</td>
+                        <td class="td-link">${{linkHtml}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'urls') {{
+                    const sc = row.status_code ? String(row.status_code) : "—";
+                    let scClass = "status-dead";
+                    if (row.status_code) {{
+                        if (row.status_code < 300) scClass = "status-2xx";
+                        else if (row.status_code < 400) scClass = "status-3xx";
+                        else if (row.status_code < 500) scClass = "status-4xx";
+                        else scClass = "status-5xx";
+                    }}
+                    const cdnHtml = row.cdn_name ? `<span class="cdn-tag">${{esc(row.cdn_name)}}</span>` : '—';
+                    html += `<tr>
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.url)}}"></td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.url)}}">${{esc(row.url) || '—'}}</span></td>
+                        <td class="td-status"><span class="status-pill ${{scClass}}">${{esc(sc)}}</span></td>
+                        <td class="td-method">${{esc(row.method) || '—'}}</td>
+                        <td class="td-title text-ellipsis" title="${{esc(row.title)}}">${{esc(row.title) || '—'}}</td>
+                        <td class="td-tech text-ellipsis" title="${{esc(row.tech)}}">${{esc((row.tech||'').substring(0,40)) || '—'}}</td>
+                        <td class="td-server">${{esc(row.webserver) || '—'}}</td>
+                        <td class="td-ip"><span class="mono-text">${{esc(row.host_ip) || '—'}}</span></td>
+                        <td class="td-cdn">${{cdnHtml}}</td>
+                        <td class="td-date">${{esc((row.scanned_at||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'ports') {{
+                    const ports = (row.open_ports || '').split(',');
+                    let portTags = ports.slice(0, 8).map(p => `<span class="port-tag">${{esc(p.trim())}}</span>`).join('');
+                    if (ports.length > 8) portTags += `<span class="port-tag port-more">+${{ports.length - 8}}</span>`;
+                    html += `<tr>
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.subdomain)}}"></td>
+                        <td class="td-host"><span class="mono-text">${{esc(row.subdomain)}}</span></td>
+                        <td class="td-host"><span class="mono-text">${{esc(row.host || row.subdomain)}}</span></td>
+                        <td class="td-ip"><span class="mono-text">${{esc(row.ip) || '—'}}</span></td>
+                        <td class="td-ports"><div class="port-list">${{portTags}}</div></td>
+                        <td class="td-date">${{esc((row.scanned_at||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'vulns') {{
+                    const sev = (row.severity || 'unknown').toLowerCase();
+                    html += `<tr class="vuln-row-${{sev}}">
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.url || row.subdomain)}}"></td>
+                        <td class="td-severity"><span class="sev-pill sev-${{sev}}">${{esc((row.severity || 'unknown').toUpperCase())}}</span></td>
+                        <td class="td-host"><span class="mono-text text-ellipsis">${{esc(row.subdomain)}}</span></td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.url)}}">${{esc(row.url) || '—'}}</span></td>
+                        <td class="td-name text-ellipsis" title="${{esc(row.name)}}">${{esc(row.name) || '—'}}</td>
+                        <td class="td-template"><span class="mono-text text-ellipsis">${{esc(row.template_id) || '—'}}</span></td>
+                        <td class="td-date">${{esc((row.scanned_at||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'katana') {{
+                    html += `<tr>
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.url)}}"></td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.url)}}">${{esc(row.url)}}</span></td>
+                        <td class="td-host"><span class="mono-text">${{esc(row.subdomain)}}</span></td>
+                        <td class="td-date">${{esc((row.scanned_at||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'jsfiles') {{
+                    const activeClass = row.is_active ? 'row-active' : 'row-inactive';
+                    const pillClass = row.is_active ? 'status-active' : 'status-inactive';
+                    const pillText = row.is_active ? 'Active' : 'Inactive';
+                    html += `<tr class="${{activeClass}}">
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.url)}}"></td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.url)}}">${{esc(row.url)}}</span></td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.source_url)}}">${{esc(row.source_url) || '—'}}</span></td>
+                        <td class="td-size">${{row.content_length || '—'}}</td>
+                        <td class="td-hash"><span class="mono-text">${{esc((row.current_hash || '').substring(0,10))}}…</span></td>
+                        <td class="td-status"><span class="status-pill ${{pillClass}}">${{pillText}}</span></td>
+                        <td class="td-date">${{esc((row.last_seen_at||'').substring(0,10))}}</td>
+                        <td class="td-date">${{esc(((row.last_changed_at || row.first_seen_at)||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'jsfindings') {{
+                    const criticalCategories = ['api_key', 'aws_key', 'aws_secret', 'google_api_key', 'credential', 'jwt'];
+                    const isCrit = criticalCategories.includes(row.category);
+                    let rowClass = isCrit ? 'row-critical ' : '';
+                    rowClass += !row.is_active ? 'row-inactive' : '';
+                    const valueDisp = row.value.length > 80 ? row.value.substring(0,80) + '…' : row.value;
+                    const pillClass = row.is_active ? 'status-active' : 'status-inactive';
+                    const pillText = row.is_active ? 'Active' : 'Old';
+                    html += `<tr class="${{rowClass}}">
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.value)}}"></td>
+                        <td class="td-category"><span class="cat-pill ${{isCrit ? 'cat-critical' : ''}}">${{esc(row.category)}}</span></td>
+                        <td class="td-value text-ellipsis" title="${{esc(row.value)}}">${{esc(valueDisp)}}</td>
+                        <td class="td-type">${{esc(row.source_type)}}</td>
+                        <td class="td-url"><span class="mono-text text-ellipsis" title="${{esc(row.source_url)}}">${{esc(row.source_url) || '—'}}</span></td>
+                        <td class="td-context text-ellipsis" title="${{esc(row.context)}}">${{esc((row.context||'').substring(0,50)) || (row.context ? '' : '—')}}</td>
+                        <td class="td-status"><span class="status-pill ${{pillClass}}">${{pillText}}</span></td>
+                        <td class="td-date">${{esc((row.last_seen_at||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'asn') {{
+                    const rowClass = row.alive ? 'row-active' : 'row-inactive';
+                    const pillClass = row.alive ? 'status-alive' : 'status-dead';
+                    const pillText = row.alive ? 'Alive' : 'Dead';
+                    html += `<tr class="${{rowClass}}">
+                        <td class="td-check"><input type="checkbox" class="row-cb" value="${{esc(row.ip)}}"></td>
+                        <td class="td-ip"><span class="mono-text">${{esc(row.ip)}}</span></td>
+                        <td class="td-asn"><span class="mono-text">${{esc(row.asn) || '—'}}</span></td>
+                        <td class="td-cidr"><span class="mono-text">${{esc(row.cidr) || '—'}}</span></td>
+                        <td class="td-status"><span class="status-pill ${{pillClass}}">${{pillText}}</span></td>
+                        <td class="td-date">${{esc((row.last_seen||'').substring(0,10))}}</td>
+                    </tr>`;
+                }}
+                else if (currentTab === 'history') {{
+                    const statusClass = row.status === 'ok' ? 'status-ok' : (row.status === 'running' ? 'status-running' : 'status-error');
+                    html += `<tr>
+                        <td class="td-date">${{esc((row.started_at||'').substring(0,19).replace('T', ' '))}}</td>
+                        <td class="td-status"><span class="status-pill ${{statusClass}}">${{esc(row.status)}}</span></td>
+                        <td class="td-num">${{row.discovered}}</td>
+                        <td class="td-num">${{row.new_subdomains}}</td>
+                        <td class="td-num">${{row.live_subdomains}}</td>
+                        <td class="td-num td-vuln-highlight">${{row.nuclei_findings}}</td>
+                        <td class="td-num">${{row.katana_urls}}</td>
+                        <td class="td-num">${{row.js_files_found}}</td>
+                        <td class="td-num">${{row.js_files_changed}}</td>
+                        <td class="td-num">${{row.js_findings_new}}</td>
+                        <td class="td-num td-crit-highlight">${{row.js_findings_critical}}</td>
+                        <td class="td-date">${{esc((row.finished_at||'—').substring(0,19).replace('T', ' '))}}</td>
+                    </tr>`;
                 }}
             }});
+            
+            tbody.innerHTML = html;
+            
+            document.getElementById('rowCount').textContent = `${{totalRows.toLocaleString()}} rows`;
+            document.getElementById('pageInfo').textContent = `Page ${{currentPage}} of ${{totalPages}}`;
+            document.getElementById('selectAll').checked = false;
         }}
         
-        function getSelectedValues(tableId) {{
-            const table = document.getElementById(`table-${{tableId}}`);
-            if (!table) return [];
-            return Array.from(table.querySelectorAll('.row-select:checked'))
-                .map(cb => cb.value)
-                .filter(v => v);
+        function changePageSize() {{
+            pageSize = parseInt(document.getElementById('pageSize').value, 10);
+            currentPage = 1;
+            renderTable();
         }}
         
-        function downloadSelected(tableId) {{
-            const values = getSelectedValues(tableId);
-            if (values.length === 0) {{
-                alert('No rows selected. Click checkboxes to select rows.');
-                return;
+        function prevPage() {{
+            if (currentPage > 1) {{
+                currentPage--;
+                renderTable();
             }}
-            downloadText(values.join('\\n'), `recon_${{tableId}}_selected.txt`, 'text/plain');
         }}
         
-        function copySelected(tableId) {{
-            const values = getSelectedValues(tableId);
-            if (values.length === 0) {{
-                alert('No rows selected.');
-                return;
+        function nextPage() {{
+            const totalPages = Math.ceil(filteredData.length / pageSize) || 1;
+            if (currentPage < totalPages) {{
+                currentPage++;
+                renderTable();
             }}
-            navigator.clipboard.writeText(values.join('\\n')).then(() => {{
-                alert(`Copied ${{values.length}} items to clipboard!`);
+        }}
+        
+        function getFilterVal(id) {{
+            const el = document.getElementById(id);
+            return el ? el.value : '';
+        }}
+        
+        function clearFilters() {{
+            document.getElementById('searchInput').value = '';
+            document.querySelectorAll('.filter-select').forEach(s => s.value = '');
+            if(document.getElementById('pageSize')) document.getElementById('pageSize').value = pageSize;
+            applyFilters();
+        }}
+        
+        // Selection
+        function toggleSelectAll(checked) {{
+            const table = document.querySelector(`#tab-${{currentTab}} table`);
+            if (!table) return;
+            table.querySelectorAll('.row-cb').forEach(cb => {{
+                cb.checked = checked;
             }});
         }}
         
-        function downloadCurrentTab() {{
-            const table = document.getElementById(`table-${{currentTab}}`);
-            if (!table) return;
+        function getSelected() {{
+            const table = document.querySelector(`#tab-${{currentTab}} table`);
+            if (!table) return [];
+            return Array.from(table.querySelectorAll('.row-cb:checked')).map(cb => cb.value).filter(Boolean);
+        }}
+        
+        function copySelected() {{
+            const vals = getSelected();
+            if (!vals.length) {{ alert('No rows selected on this page'); return; }}
+            navigator.clipboard.writeText(vals.join('\\n')).then(() => alert(`Copied ${{vals.length}} items`));
+        }}
+        
+        // Download functions
+        function downloadCurrentCSV() {{
+            if (!filteredData.length) return;
             
-            const headers = Array.from(table.querySelectorAll('thead th'))
-                .map(th => th.textContent.trim())
-                .filter(h => h);
+            const table = document.querySelector(`#tab-${{currentTab}} table`);
+            const headers = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim()).filter(h => h);
             
-            const rows = Array.from(table.querySelectorAll('tbody tr:not(.hidden)'))
-                .map(row => Array.from(row.querySelectorAll('td'))
-                    .map(td => td.textContent.trim().replace(/\\n/g, ' '))
-                    .join(',')
-                );
+            // Generate rows from filteredData, not just the visible page
+            let csvRows = [];
+            filteredData.forEach(row => {{
+                let vals = [];
+                if (currentTab === 'subdomains') {{
+                    vals = [row.host, row.alive?'ALIVE':'DEAD', row.http_title, row.http_tech, (row.ports||[]).join(';'), row.nuclei_count, row.last_seen];
+                }} else if (currentTab === 'urls') {{
+                    vals = [row.url, row.status_code, row.method, row.title, row.tech, row.webserver, row.host_ip, row.cdn_name, row.scanned_at];
+                }} else if (currentTab === 'ports') {{
+                    vals = [row.subdomain, row.host||row.subdomain, row.ip, row.open_ports, row.scanned_at];
+                }} else if (currentTab === 'vulns') {{
+                    vals = [row.severity, row.subdomain, row.url, row.name, row.template_id, row.scanned_at];
+                }} else if (currentTab === 'katana') {{
+                    vals = [row.url, row.subdomain, row.scanned_at];
+                }} else if (currentTab === 'jsfiles') {{
+                    vals = [row.url, row.source_url, row.content_length, row.current_hash, row.is_active?'Active':'Inactive', row.last_seen_at, row.last_changed_at];
+                }} else if (currentTab === 'jsfindings') {{
+                    vals = [row.category, row.value, row.source_type, row.source_url, row.context, row.is_active?'Active':'Old', row.last_seen_at];
+                }} else if (currentTab === 'asn') {{
+                    vals = [row.ip, row.asn, row.cidr, row.alive?'Alive':'Dead', row.last_seen];
+                }} else if (currentTab === 'history') {{
+                    vals = [row.started_at, row.status, row.discovered, row.new_subdomains, row.live_subdomains, row.nuclei_findings, row.katana_urls, row.js_files_found, row.js_files_changed, row.js_findings_new, row.js_findings_critical, row.finished_at];
+                }} else {{
+                    vals = Object.values(row);
+                }}
+                csvRows.push(vals.map(v => '"' + String(v||'').replace(/"/g, '""') + '"').join(','));
+            }});
             
-            const csv = [headers.join(','), ...rows].join('\\n');
-            downloadText(csv, `recon_${{currentTab}}.csv`, 'text/csv');
+            downloadFile([headers.join(','), ...csvRows].join('\\n'), `recon_${{currentTab}}.csv`, 'text/csv');
         }}
         
         function downloadJSON() {{
-            const json = JSON.stringify(reportData, null, 2);
-            downloadText(json, `recon_${{reportData.program.name}}.json`, 'application/json');
+            downloadFile(JSON.stringify(DATA, null, 2), `recon_${{DATA.program.name}}.json`, 'application/json');
         }}
         
-        function downloadText(content, filename, type) {{
+        function downloadFile(content, name, type) {{
             const blob = new Blob([content], {{ type }});
-            const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
+            a.href = URL.createObjectURL(blob);
+            a.download = name;
             a.click();
-            URL.revokeObjectURL(url);
+            URL.revokeObjectURL(a.href);
         }}
         
         // Keyboard shortcuts
-        document.addEventListener('keydown', (e) => {{
-            if (e.ctrlKey || e.metaKey) {{
-                if (e.key === 'f') {{
-                    e.preventDefault();
-                    document.querySelector('.search-input').focus();
-                }}
-                if (e.key === 's') {{
-                    e.preventDefault();
-                    downloadJSON();
-                }}
+        document.addEventListener('keydown', e => {{
+            if ((e.ctrlKey || e.metaKey) && e.key === 'f') {{
+                e.preventDefault();
+                document.getElementById('searchInput').focus();
+            }}
+            if ((e.ctrlKey || e.metaKey) && e.key === 's') {{
+                e.preventDefault();
+                downloadJSON();
+            }}
+            if (e.key === 'Escape') {{
+                clearFilters();
+                document.getElementById('searchInput').blur();
             }}
         }});
         
-        // Auto-switch to vulnerabilities tab if critical findings exist
-        (function() {{
-            const criticalCount = {self.summary['nuclei_by_severity'].get('critical', 0)} +
-                                 {self.summary['nuclei_by_severity'].get('high', 0)} +
-                                 {self.summary['critical_js_findings']};
-            if (criticalCount > 0) {{
-                console.log(`%c⚠️ ${{criticalCount}} critical/high findings detected!`, 'color: #fca5a5; font-size: 14px;');
-            }}
-        }})();
+        // Init
+        updateFilterVisibility();
+        applyFilters();
         """
-
 
 # =============================================================================
 # Multi-Program Export
@@ -1483,7 +1749,7 @@ def export_all_programs(
 
         for prog in programs:
             if not prog["enabled"]:
-                print(f"    - Skipping disabled program: {prog['name']}")
+                print(f"    - Skipping disabled: {prog['name']}")
                 continue
 
             print(f"\n[*] Exporting: {prog['name']}")
@@ -1499,165 +1765,94 @@ def export_all_programs(
                     generator.generate(program_dir / f"{prog['name']}_report.html")
 
             except Exception as e:
-                print(f"[!] Error exporting {prog['name']}: {e}")
+                print(f"[!] Error: {e}")
 
-        # Generate index page
-        _generate_index(output_dir, programs, extractor, severity_filter)
+        _generate_index(output_dir, programs, extractor)
 
     finally:
         extractor.close()
 
 
-def _generate_index(
-    output_dir: Path,
-    programs: list[dict],
-    extractor: DatabaseExtractor,
-    severity_filter: Optional[list[str]]
-) -> None:
-    program_cards = []
+def _generate_index(output_dir: Path, programs: list[dict], extractor: DatabaseExtractor) -> None:
+    cards = []
     for prog in programs:
         if not prog["enabled"]:
             continue
         stats = extractor._get_program_stats(prog["id"])
-        program_cards.append(f"""
-        <div class="program-card">
+        cards.append(f"""
+        <div class="prog-card">
             <h3>{escape(prog['name'])}</h3>
-            <div class="program-stats">
-                <div class="stat"><span class="stat-value">{stats.get('subdomains', 0):,}</span><span class="stat-label">Subdomains</span></div>
-                <div class="stat"><span class="stat-value">{stats.get('nuclei_findings', 0):,}</span><span class="stat-label">Vulns</span></div>
-                <div class="stat"><span class="stat-value">{stats.get('katana_results', 0):,}</span><span class="stat-label">Katana</span></div>
-                <div class="stat"><span class="stat-value">{stats.get('js_findings', 0):,}</span><span class="stat-label">JS Findings</span></div>
+            <div class="prog-stats">
+                <div class="prog-stat"><span class="prog-val">{stats.get('subdomains', 0):,}</span><span class="prog-lbl">Subs</span></div>
+                <div class="prog-stat"><span class="prog-val">{stats.get('nuclei_findings', 0):,}</span><span class="prog-lbl">Vulns</span></div>
+                <div class="prog-stat"><span class="prog-val">{stats.get('katana_results', 0):,}</span><span class="prog-lbl">Katana</span></div>
+                <div class="prog-stat"><span class="prog-val">{stats.get('js_findings', 0):,}</span><span class="prog-lbl">JS</span></div>
             </div>
-            <div class="program-links">
-                <a href="{escape(prog['name'])}/{escape(prog['name'])}_report.html" class="btn btn-primary">View Report</a>
-                <a href="{escape(prog['name'])}/{escape(prog['name'])}_report.json" class="btn btn-secondary">JSON</a>
-            </div>
-            <div class="program-meta">
-                Last scanned: {escape((prog['last_scanned_at'] or 'Never')[:10])}
+            <div class="prog-links">
+                <a href="{escape(prog['name'])}/{escape(prog['name'])}_report.html" class="btn btn-primary btn-sm">HTML</a>
+                <a href="{escape(prog['name'])}/{escape(prog['name'])}_report.json" class="btn btn-secondary btn-sm">JSON</a>
             </div>
         </div>""")
 
-    index_html = f"""<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Recon Reports Index</title>
+    <title>Recon Reports</title>
     <style>
-        :root {{ --bg: #0f172a; --bg2: #1e293b; --bg3: #334155; --text: #f1f5f9; --text2: #94a3b8; --accent: #3b82f6; --border: #334155; }}
+        :root {{ --bg: #0a0e1a; --bg2: #111827; --bg3: #1f2937; --text: #f9fafb; --text2: #9ca3af; --accent: #3b82f6; --border: #1f2937; }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }}
-        .container {{ max-width: 1200px; margin: 0 auto; padding: 40px 20px; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 40px 24px; }}
         h1 {{ text-align: center; margin-bottom: 40px; font-size: 2rem; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }}
-        .program-card {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 24px; transition: transform 0.2s; }}
-        .program-card:hover {{ transform: translateY(-4px); }}
-        .program-card h3 {{ color: var(--accent); margin-bottom: 16px; font-size: 1.3rem; }}
-        .program-stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }}
-        .stat {{ text-align: center; }}
-        .stat-value {{ display: block; font-size: 1.5rem; font-weight: 700; }}
-        .stat-label {{ font-size: 0.8rem; color: var(--text2); }}
-        .program-links {{ display: flex; gap: 12px; margin-bottom: 16px; }}
-        .btn {{ padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 0.9rem; font-weight: 500; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }}
+        .prog-card {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }}
+        .prog-card h3 {{ color: var(--accent); margin-bottom: 16px; }}
+        .prog-stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }}
+        .prog-stat {{ text-align: center; }}
+        .prog-val {{ display: block; font-size: 1.3rem; font-weight: 700; }}
+        .prog-lbl {{ font-size: 0.75rem; color: var(--text2); }}
+        .prog-links {{ display: flex; gap: 8px; }}
+        .btn {{ padding: 6px 14px; border-radius: 5px; text-decoration: none; font-size: 0.85rem; font-weight: 500; }}
         .btn-primary {{ background: var(--accent); color: white; }}
         .btn-secondary {{ background: var(--bg3); color: var(--text); }}
-        .program-meta {{ font-size: 0.8rem; color: var(--text2); }}
+        .btn-sm {{ padding: 5px 12px; font-size: 0.8rem; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🛡️ Recon Reports</h1>
-        <div class="grid">{"".join(program_cards)}</div>
+        <div class="grid">{"".join(cards)}</div>
     </div>
 </body>
 </html>"""
 
-    index_path = output_dir / "index.html"
-    index_path.write_text(index_html, encoding="utf-8")
-    print(f"\n[+] Index page created: {index_path}")
+    (output_dir / "index.html").write_text(html, encoding="utf-8")
+    print(f"\n[+] Index: {output_dir / 'index.html'}")
 
 
 # =============================================================================
-# CLI Interface
+# CLI
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export bug bounty recon data to HTML reports and JSON",
+        description="Export recon data to HTML/JSON",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # List all programs in database
-  python export.py --db ./recon.db --list-programs
-
-  # Export single program (both HTML and JSON)
-  python export.py --db ./recon.db --program "company_1"
-
-  # Export all programs to ./reports directory
-  python export.py --db ./recon.db --all-programs --output ./reports
-
-  # Export only critical and high severity findings
-  python export.py --db ./recon.db --program "company_1" --severities critical,high
-
-  # Export only JSON format
-  python export.py --db ./recon.db --program "company_1" --format json
-
-  # Export to custom output path
-  python export.py --db ./recon.db --program "company_1" --output /tmp/company1_export
-"""
     )
 
-    parser.add_argument(
-        "--db", "-d",
-        type=Path,
-        required=True,
-        help="Path to recon.db SQLite database"
-    )
+    parser.add_argument("--db", "-d", type=Path, required=True, help="Path to recon.db")
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--program", "-p",
-        type=str,
-        help="Export a specific program by name"
-    )
-    mode.add_argument(
-        "--all-programs", "-a",
-        action="store_true",
-        help="Export all enabled programs"
-    )
-    mode.add_argument(
-        "--list-programs", "-l",
-        action="store_true",
-        help="List all programs in the database and exit"
-    )
+    mode.add_argument("--program", "-p", type=str, help="Program name")
+    mode.add_argument("--all-programs", "-a", action="store_true", help="Export all")
+    mode.add_argument("--list-programs", "-l", action="store_true", help="List programs")
 
-    parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        default=None,
-        help="Output directory (default: ./exports/<program_name>)"
-    )
-
-    parser.add_argument(
-        "--format", "-f",
-        type=str,
-        choices=["html", "json", "both"],
-        default="both",
-        help="Output format (default: both)"
-    )
-
-    parser.add_argument(
-        "--severities", "-s",
-        type=str,
-        default=None,
-        help="Comma-separated severity filter for nuclei findings (e.g., critical,high)"
-    )
-
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress non-error output"
-    )
+    parser.add_argument("--output", "-o", type=Path, default=None, help="Output directory")
+    parser.add_argument("--format", "-f", choices=["html", "json", "both"], default="both")
+    parser.add_argument("--severities", "-s", type=str, default=None, help="Severity filter")
+    parser.add_argument("--quiet", "-q", action="store_true")
 
     return parser.parse_args()
 
@@ -1665,7 +1860,6 @@ Examples:
 def main() -> int:
     args = parse_args()
 
-    # Validate database exists
     if not args.db.exists():
         print(f"[!] Database not found: {args.db}", file=sys.stderr)
         return 1
@@ -1674,77 +1868,48 @@ def main() -> int:
     try:
         extractor.connect()
 
-        # List programs mode
         if args.list_programs:
             programs = extractor.list_programs()
             if not programs:
-                print("[!] No programs found in database")
+                print("[!] No programs found")
                 return 1
-
-            print(f"\n{'ID':<5} {'Enabled':<10} {'Last Scanned':<20} {'Program Name'}")
-            print("-" * 70)
+            print(f"\n{'ID':<5} {'Status':<10} {'Last Scan':<22} {'Program'}")
+            print("-" * 60)
             for p in programs:
-                enabled = "✓" if p["enabled"] else "✗"
+                status = "✓ enabled" if p["enabled"] else "✗ disabled"
                 last = (p["last_scanned_at"] or "Never")[:19].replace("T", " ")
-                print(f"{p['id']:<5} {enabled:<10} {last:<20} {p['name']}")
-            print(f"\nTotal: {len(programs)} programs")
+                print(f"{p['id']:<5} {status:<10} {last:<22} {p['name']}")
             return 0
 
-        # Parse severity filter
         severity_filter = None
         if args.severities:
             severity_filter = [s.strip().lower() for s in args.severities.split(",")]
-            valid_sevs = {"critical", "high", "medium", "low", "info"}
-            invalid = set(severity_filter) - valid_sevs
-            if invalid:
-                print(f"[!] Invalid severities: {invalid}. Valid: {valid_sevs}", file=sys.stderr)
-                return 1
 
-        # Export all programs
         if args.all_programs:
             output_dir = args.output or args.db.parent / "exports"
-            if not args.quiet:
-                print(f"[*] Exporting all programs to: {output_dir}")
             export_all_programs(args.db, output_dir, severity_filter, args.format)
             return 0
 
-        # Export single program
         if args.program:
             program_id = extractor.get_program_id(args.program)
             if not program_id:
                 print(f"[!] Program not found: {args.program}", file=sys.stderr)
-                print("[!] Use --list-programs to see available programs", file=sys.stderr)
                 return 1
 
             output_dir = args.output or args.db.parent / "exports" / args.program
-
-            if not args.quiet:
-                print(f"[*] Exporting program: {args.program} (ID: {program_id})")
-                if severity_filter:
-                    print(f"[*] Severity filter: {', '.join(severity_filter)}")
-
             data = extractor.extract_program(program_id, severity_filter)
 
             if args.format in ("json", "both"):
                 export_json(data, output_dir / f"{args.program}_report.json")
-
             if args.format in ("html", "both"):
-                generator = HTMLReportGenerator(data)
-                generator.generate(output_dir / f"{args.program}_report.html")
+                HTMLReportGenerator(data).generate(output_dir / f"{args.program}_report.html")
 
             if not args.quiet:
-                print(f"\n[*] Export complete!")
-                print(f"    Output directory: {output_dir}")
-
+                print(f"\n[+] Done! Output: {output_dir}")
             return 0
 
-    except FileNotFoundError as e:
-        print(f"[!] {e}", file=sys.stderr)
-        return 1
     except Exception as e:
-        print(f"[!] Unexpected error: {e}", file=sys.stderr)
-        if args.quiet:
-            raise
+        print(f"[!] Error: {e}", file=sys.stderr)
         return 1
     finally:
         extractor.close()
