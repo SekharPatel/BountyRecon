@@ -10,7 +10,7 @@ What it does:
 - Keeps each program fully separated by program_id
 - Runs one scan cycle per invocation:
     subfinder -> compare with previous results -> httpx alive check -> [naabu + katana] (parallel) -> nuclei -> Telegram
-- Saves all artifacts under per-program folders
+- Saves all output under per-program folders
 
 Run it from a Linux service or timer to control scheduling externally.
 
@@ -25,8 +25,10 @@ Configuration:
     HTTPX_BIN            - Path to httpx binary (default: httpx)
     NAABU_BIN            - Path to naabu binary (default: naabu)
     NUCLEI_BIN           - Path to nuclei binary (default: nuclei)
-    KATANA_BIN           - Path to katana binary (default: katana)
+    NUCLEI_ENABLED       - Enable/disable nuclei (default: true)
     NUCLEI_SEVERITIES    - Nuclei severity filter (default: medium,high,critical)
+    KATANA_BIN           - Path to katana binary (default: katana)
+    KATANA_ENABLED       - Enable/disable katana (default: true)
     SUBFINDER_TIMEOUT    - Subfinder timeout in seconds (default: 3600)
     HTTPX_TIMEOUT        - HTTPX timeout in seconds (default: 1800)
     NAABU_TIMEOUT        - Naabu timeout in seconds (default: 3600)
@@ -44,7 +46,7 @@ Configuration:
     ASN_ALIVE_TIMEOUT    - naabu alive-check timeout for ASN IPs in seconds (default: 1800)
     ASN_MAX_IPS          - Hard cap on expanded IPs per program, safety valve for large ASNs (default: 65536)
     ASN_EXCLUDE_CDN      - Skip naabu -exclude-cdn filtering on ASN-derived IPs (default: true)
-    MAX_JOB_RETENTION_DAYS - Auto-delete scan artifacts older than N days (default: 30, 0=disable)
+    MAX_JOB_RETENTION_DAYS - Auto-delete scan output older than N days (default: 30, 0=disable)
     DRY_RUN              - Skip external tool execution for testing (default: false)
 
 
@@ -133,12 +135,14 @@ class Config:
     katana_bin: str = "katana"
     asnmap_bin: str = "asnmap"
     mapcidr_bin: str = "mapcidr"
+    nuclei_enabled: bool = True
     nuclei_severities: str = "medium,high,critical"
     subfinder_timeout: int = 3600
     httpx_timeout: int = 1800
     naabu_timeout: int = 3600
     naabu_nmap_cli: bool = False
     nuclei_timeout: int = 3600
+    katana_enabled: bool = True
     katana_timeout: int = 3600
     katana_depth: int = 3
     katana_headless: bool = False
@@ -376,14 +380,15 @@ CREATE TABLE IF NOT EXISTS asn_ips (
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS artifacts (
+CREATE TABLE IF NOT EXISTS asn_httpx_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     program_id INTEGER NOT NULL,
-    subdomain TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    path TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    meta TEXT,
+    ip TEXT NOT NULL,
+    port INTEGER,
+    url TEXT,
+    status_code INTEGER,
+    title TEXT,
+    scanned_at TEXT NOT NULL,
     FOREIGN KEY(program_id) REFERENCES programs(id) ON DELETE CASCADE
 );
 
@@ -417,7 +422,6 @@ CREATE INDEX IF NOT EXISTS idx_subdomains_program ON subdomains(program_id);
 CREATE INDEX IF NOT EXISTS idx_httpx_program ON httpx_results(program_id);
 CREATE INDEX IF NOT EXISTS idx_ports_program ON ports(program_id);
 CREATE INDEX IF NOT EXISTS idx_nuclei_program ON nuclei_findings(program_id);
-CREATE INDEX IF NOT EXISTS idx_artifacts_program ON artifacts(program_id);
 CREATE INDEX IF NOT EXISTS idx_katana_program ON katana_results(program_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nuclei_unique ON nuclei_findings(program_id, subdomain, template_id, url);
 CREATE INDEX IF NOT EXISTS idx_js_files_program ON js_files(program_id);
@@ -427,10 +431,11 @@ CREATE INDEX IF NOT EXISTS idx_js_findings_active ON js_findings(program_id, is_
 CREATE INDEX IF NOT EXISTS idx_js_scan_history_program ON js_scan_history(program_id);
 CREATE INDEX IF NOT EXISTS idx_asn_ranges_program ON asn_ranges(program_id);
 CREATE INDEX IF NOT EXISTS idx_asn_ips_program ON asn_ips(program_id);
+CREATE INDEX IF NOT EXISTS idx_asn_httpx_program ON asn_httpx_results(program_id);
 """
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -470,6 +475,19 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                     cur.execute(f"ALTER TABLE runs ADD COLUMN {column}")
                 except sqlite3.OperationalError:
                     pass
+        if current < 6:
+            # v6: Remove duplicate rows from js_findings keeping the lowest id per unique key.
+            try:
+                cur.execute("""
+                    DELETE FROM js_findings
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM js_findings
+                        GROUP BY program_id, source_type, category, value
+                    )
+                """)
+            except sqlite3.OperationalError:
+                pass
         if current < CURRENT_SCHEMA_VERSION:
             cur.execute(
                 "UPDATE schema_version SET version=?, updated_at=?",
@@ -1334,6 +1352,16 @@ def run_js_monitor_scan(
                     discovered_js.add(child_js)
                     js_sources.setdefault(child_js, js_url)
 
+        # Deduplicate findings: keep first occurrence per (source_type, category, value)
+        seen_findings: set[tuple[str, str, str]] = set()
+        deduped_findings: list[dict[str, str]] = []
+        for finding in result["findings"]:
+            key = (finding.get("source_type", "javascript"), finding.get("category", ""), finding.get("value", ""))
+            if key not in seen_findings:
+                seen_findings.add(key)
+                deduped_findings.append(finding)
+        result["findings"] = deduped_findings
+
         result["discovered_js_urls"] = sorted(discovered_js)
         result["fetched_js_urls"] = sorted(fetched_js)
 
@@ -2028,15 +2056,6 @@ def store_httpx(conn: sqlite3.Connection, program_id: int, results: list[dict[st
             ),
         )
 
-        if r["screenshot_path"]:
-            cur.execute(
-                """
-                INSERT INTO artifacts (program_id, subdomain, kind, path, created_at, meta)
-                VALUES (?, ?, 'screenshot', ?, ?, ?)
-                """,
-                (program_id, sub, r["screenshot_path"], now, None),
-            )
-
     conn.commit()
 
 
@@ -2363,21 +2382,144 @@ def mark_asn_ips_alive(conn: sqlite3.Connection, program_id: int, alive_ips: lis
     conn.commit()
 
 
-def run_asn_recon(cfg: Config, roots: list[str], job_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+def store_asn_httpx(conn: sqlite3.Connection, program_id: int, results: list[dict[str, Any]]) -> None:
+    """Store httpx results from ASN pipeline into asn_httpx_results table."""
+    if not results:
+        return
+    now = utc_now()
+    cur = conn.cursor()
+    for r in results:
+        cur.execute(
+            """
+            INSERT INTO asn_httpx_results (
+                program_id, ip, port, url, status_code, title, scanned_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                program_id,
+                r.get("ip", ""),
+                r.get("port"),
+                r.get("url", ""),
+                r.get("status_code"),
+                r.get("title", ""),
+                now,
+            ),
+        )
+    conn.commit()
+
+
+def run_asn_httpx(
+    cfg: Config,
+    port_results: list[dict[str, Any]],
+    job_dir: Path,
+    log_prefix: str = "",
+) -> list[dict[str, Any]]:
+    """Run httpx on alive IPs with open ports to get status codes and titles.
+    Generates targets as IP:PORT for each unique IP:port combination.
+    """
+    if not port_results:
+        return []
+    if cfg.dry_run:
+        logging.info("[DRY_RUN] Skipping ASN httpx for %d port results", len(port_results))
+        return []
+
+    # Build unique IP:PORT targets
+    seen_targets: set[tuple[str, int]] = set()
+    targets: list[str] = []
+    for p in port_results:
+        host = (p.get("host") or p.get("ip") or p.get("subdomain", "")).strip()
+        port = p.get("port")
+        if not host or not port:
+            continue
+        key = (host, int(port))
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+        targets.append(f"{host}:{port}")
+
+    if not targets:
+        return []
+
+    target_file = job_dir / "asn_httpx_targets.txt"
+    target_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
+
+    out_file = job_dir / "asn_httpx.jsonl"
+    cmd = [
+        cfg.httpx_bin,
+        "-l", str(target_file),
+        "-json",
+        "-sc",
+        "-title",
+        "-no-color",
+        "-silent",
+        "-o", str(out_file),
+    ]
+    if cfg.httpx_args:
+        cmd.extend(shlex.split(cfg.httpx_args))
+
+    run_cmd(cmd, timeout=cfg.httpx_timeout, log_prefix=log_prefix)
+
+    results: list[dict[str, Any]] = []
+    _seen_lines: set[str] = set()
+    if out_file.exists():
+        for line in out_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line in _seen_lines:
+                continue
+            _seen_lines.add(line)
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            host = str(first_value(obj, ["host", "input", "ip"], "")).strip().rstrip(".")
+            url = str(first_value(obj, ["url", "final_url"], "")).strip()
+            status_code = first_value(obj, ["status_code", "status"], None)
+            title = ensure_utf8_text(first_value(obj, ["title"], ""))
+            port_val = first_value(obj, ["port"], None)
+
+            # Extract IP from host (might be IP:port format)
+            ip = host.split(":")[0] if ":" in host else host
+
+            results.append({
+                "ip": ip,
+                "port": int(port_val) if port_val and str(port_val).isdigit() else None,
+                "url": url,
+                "status_code": int(status_code) if isinstance(status_code, (int, float, str)) and str(status_code).isdigit() else None,
+                "title": title,
+            })
+
+    return results
+
+
+def run_asn_recon(cfg: Config, roots: list[str], job_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str], list[dict[str, Any]]]:
+    """ASN recon: asnmap → mapcidr → naabu (alive IPs + open ports).
+    Returns (asn_ranges, all_ips, alive_ips, port_results).
+    """
     if not cfg.asn_enabled:
-        return [], [], []
+        return [], [], [], []
 
     asn_ranges = run_asnmap(cfg, roots, job_dir, log_prefix="[ASN Pipeline]")
     if not asn_ranges:
-        return [], [], []
+        return [], [], [], []
 
     cidrs = [r["cidr"] for r in asn_ranges]
     ips = run_mapcidr_expand(cfg, cidrs, job_dir, cap=cfg.asn_max_ips, log_prefix="[ASN Pipeline]")
     if not ips:
-        return asn_ranges, [], []
+        return asn_ranges, [], [], []
 
-    alive_ips = run_asn_alive_check(cfg, ips, job_dir, log_prefix="[ASN Pipeline]")
-    return asn_ranges, ips, alive_ips
+    # Use naabu with alive_check=True to get both alive IPs and open ports
+    port_results = run_naabu(cfg, ips, job_dir, alive_check=True, log_prefix="[ASN Pipeline]")
+
+    # Extract unique alive IPs from port results
+    alive_set: set[str] = set()
+    for p in port_results:
+        host = p.get("host") or p.get("ip") or p.get("subdomain", "")
+        if host:
+            alive_set.add(host.strip())
+    alive_ips = sorted(alive_set)
+
+    return asn_ranges, ips, alive_ips, port_results
 
 
 # -----------------------------
@@ -2766,6 +2908,7 @@ def group_by_subdomain(items: list[dict[str, Any]]) -> dict[str, list[dict[str, 
 
 
 def build_program_summary_report(
+    cfg: Config,
     program_name: str,
     roots: list[str],
     job_dir: Path,
@@ -2790,15 +2933,14 @@ def build_program_summary_report(
         f"Program: {md_code(program_name)}",
         f"Time: {md_text(utc_now(), 40)}",
         f"Scope roots: {len(roots)} ({format_code_list(roots, 8)})",
-        f"Artifacts: {md_code(str(job_dir), 240)}",
         "",
         "**Tool summary**",
         f"- Subfinder: {discovered_count} discovered, {len(new_hosts)} new, {len(seen_hosts)} already known",
         f"- HTTPX: {len(httpx_results)} checked, {len(live_hosts)} live",
         f"- Naabu: {len(port_results)} port/service result(s)",
-        f"- Katana: {katana_urls_count} crawled URL(s)",
+        f"- Katana: {katana_urls_count} crawled URL(s)" + ("" if cfg.katana_enabled else " (disabled)"),
         f"- JS Monitor: {format_js_monitor_counts(js_monitor_result)}",
-        f"- Nuclei: {len(nuclei_findings)} finding(s) ({format_severity_counts(nuclei_findings)})",
+        f"- Nuclei: {len(nuclei_findings)} finding(s) ({format_severity_counts(nuclei_findings)})" + ("" if cfg.nuclei_enabled else " (disabled)"),
         "",
         "**New subdomains**",
         format_code_list(new_hosts),
@@ -2862,6 +3004,7 @@ def notify_program_summary(
         return
 
     report = build_program_summary_report(
+        cfg=cfg,
         program_name=program_name,
         roots=roots,
         job_dir=job_dir,
@@ -2891,6 +3034,7 @@ def notify_js_monitor_findings(cfg: Config, program_name: str, result: dict[str,
     new_findings = result.get("new_findings", [])
     critical_findings = result.get("critical_new_findings", [])
     removed_findings = result.get("removed_findings", [])
+    non_critical_findings = [f for f in new_findings if f not in critical_findings]
 
     if not changed_files and not new_findings and not removed_findings:
         send_notify(
@@ -2899,43 +3043,68 @@ def notify_js_monitor_findings(cfg: Config, program_name: str, result: dict[str,
         )
         return
 
-    findings_to_show = new_findings
     lines = [
-        f"[{program_name}] **JS monitor finished**",
-        "",
-        f"- JS files found: {len(result.get('discovered_js_urls', []))}",
-        f"- Changed/new JS files: {len(changed_files)}",
-        f"- New regex findings: {len(new_findings)}",
-        f"- Removed findings: {len(removed_findings)}",
-        f"- Critical new findings: {len(critical_findings)}",
+        f"[{program_name}] **JS Monitor Report**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📁 JS files found: {len(result.get('discovered_js_urls', []))}",
+        f"🔄 Changed/new JS files: {len(changed_files)}",
+        f"🆕 New findings: {len(new_findings)}",
+        f"🗑 Removed findings: {len(removed_findings)}",
     ]
 
-    if changed_files:
-        lines.extend(["", "**Changed JS files**"])
-        for item in changed_files[:10]:
-            lines.append(f"- {md_code(item.get('status', 'changed'), 20)} {md_text(item.get('url', ''), 220)}")
-        if len(changed_files) > 10:
-            lines.append(f"*...and {len(changed_files) - 10} more*")
-
-    if findings_to_show:
-        lines.extend(["", "**New findings**"])
-        for finding in findings_to_show[:12]:
-            value = ensure_utf8_text(finding.get("value", ""))
-            if finding.get("category") in JS_CRITICAL_CATEGORIES:
-                value = mask_sensitive_value(value)
+    # ── Critical findings first (top priority) ───────────────────────
+    if critical_findings:
+        lines.extend(["", "🔴 **CRITICAL FINDINGS** 🔴"])
+        for finding in critical_findings[:10]:
+            value = mask_sensitive_value(ensure_utf8_text(finding.get("value", "")))
+            source = md_text(finding.get("source_url", ""), 160)
             lines.append(
-                f"- {md_code(finding.get('category', ''), 40)} "
-                f"{md_text(value, 120)} "
-                f"({md_text(finding.get('source_url', ''), 180)})"
+                f"  • {md_code(finding.get('category', ''), 30)} {md_text(value, 100)}"
             )
-        if len(findings_to_show) > 12:
-            lines.append(f"*...and {len(findings_to_show) - 12} more*")
+            lines.append(f"    ↳ {source}")
+        if len(critical_findings) > 10:
+            lines.append(f"  *...and {len(critical_findings) - 10} more critical*")
+
+    # ── Non-critical new findings grouped by category ────────────────
+    if non_critical_findings:
+        lines.extend(["", "🟡 **New Findings**"])
+        # Group by category
+        by_category: dict[str, list[dict[str, Any]]] = {}
+        for finding in non_critical_findings:
+            cat = finding.get("category", "unknown")
+            by_category.setdefault(cat, []).append(finding)
+
+        shown = 0
+        for cat, findings_list in sorted(by_category.items()):
+            if shown >= 15:
+                remaining = sum(len(v) for v in by_category.values()) - shown
+                if remaining > 0:
+                    lines.append(f"  *...and {remaining} more findings*")
+                break
+            lines.append(f"  **{cat}** ({len(findings_list)})")
+            for finding in findings_list[:5]:
+                value = ensure_utf8_text(finding.get("value", ""))
+                source = md_text(finding.get("source_url", ""), 140)
+                lines.append(f"    • {md_text(value, 100)} ({source})")
+                shown += 1
+            if len(findings_list) > 5:
+                lines.append(f"    *...and {len(findings_list) - 5} more in this category*")
+                shown += len(findings_list) - 5
+
+    # ── Changed JS files ─────────────────────────────────────────────
+    if changed_files:
+        lines.extend(["", "📝 **Changed JS Files**"])
+        for item in changed_files[:8]:
+            status_icon = "🆕" if item.get('status') == 'new' else "🔄"
+            lines.append(f"  {status_icon} {md_text(item.get('url', ''), 200)}")
+        if len(changed_files) > 8:
+            lines.append(f"  *...and {len(changed_files) - 8} more*")
 
     if result.get("skipped_deactivation"):
         lines.extend(
             [
                 "",
-                "_Some pages or JS files failed to fetch, so finding deactivation was skipped for this cycle._",
+                "⚠️ _Some pages/JS files failed to fetch — finding deactivation skipped._",
             ]
         )
 
@@ -3088,7 +3257,11 @@ def _run_web_pipeline(
             if live_hosts:
                 futures[pool.submit(run_naabu, cfg, live_hosts, job_dir)] = "naabu"
             
-            futures[pool.submit(run_katana, cfg, crawl_seed_urls, job_dir, roots)] = "katana"
+            if cfg.katana_enabled:
+                futures[pool.submit(run_katana, cfg, crawl_seed_urls, job_dir, roots)] = "katana"
+            else:
+                logging.info("[%s] Web Pipeline – katana disabled, re-using known URLs", program_name)
+                katana_urls = list(known_katana_urls)
 
             for future in as_completed(futures):
                 tool_name = futures[future]
@@ -3192,6 +3365,10 @@ def _run_web_pipeline(
         js_monitor_result: Optional[dict[str, Any]] = (
             {"status": "disabled"} if not cfg.js_monitor_enabled else None
         )
+        
+        if not cfg.nuclei_enabled:
+            logging.info("[%s] Web Pipeline – nuclei disabled", program_name)
+            nuclei_scan_urls = []
 
         if not nuclei_scan_urls:
             logging.info("[%s] Web Pipeline – No new parameter URLs found, skipping Nuclei", program_name)
@@ -3266,6 +3443,103 @@ def _run_web_pipeline(
     return result
 
 
+def build_asn_pipeline_report(
+    program_name: str,
+    asn_ranges: list[dict[str, Any]],
+    asn_ips: list[str],
+    alive_ips: list[str],
+    port_results: list[dict[str, Any]],
+    httpx_results: list[dict[str, Any]],
+) -> str:
+    """Build a well-structured ASN pipeline summary notification."""
+    # Collect unique ASNs
+    unique_asns: set[str] = set()
+    for r in asn_ranges:
+        asn = r.get("asn", "").strip()
+        if asn:
+            unique_asns.add(asn)
+
+    lines = [
+        f"[{program_name}] **ASN Pipeline Summary**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📡 **Ranges**: {len(asn_ranges)} CIDR range(s) from {len(unique_asns)} ASN(s)",
+        f"🌐 **IPs**: {len(asn_ips)} expanded → {len(alive_ips)} alive",
+    ]
+
+    if not alive_ips:
+        lines.append("\nNo alive IPs found.")
+        return "\n".join(lines)
+
+    # Build port map: ip -> list of port info
+    port_map: dict[str, list[dict[str, Any]]] = {}
+    for p in port_results:
+        host = (p.get("host") or p.get("ip") or p.get("subdomain", "")).strip()
+        if host:
+            port_map.setdefault(host, []).append(p)
+
+    # Build httpx map: (ip, port) -> httpx result
+    httpx_map: dict[tuple[str, int], dict[str, Any]] = {}
+    for h in httpx_results:
+        ip = h.get("ip", "").strip()
+        port = h.get("port")
+        if ip and port:
+            httpx_map[(ip, port)] = h
+
+    lines.extend(["", "**Alive IPs & Open Ports**"])
+
+    shown_hosts = 0
+    for ip in alive_ips:
+        if shown_hosts >= 15:
+            remaining = len(alive_ips) - shown_hosts
+            if remaining > 0:
+                lines.append(f"\n*...and {remaining} more host(s)*")
+            break
+
+        ip_ports = port_map.get(ip, [])
+        # Sort ports numerically
+        ip_ports.sort(
+            key=lambda x: int(x.get("port", 0))
+            if str(x.get("port", "0")).isdigit()
+            else 0
+        )
+
+        lines.append(f"\n🔹 **{ip}**")
+        if not ip_ports:
+            lines.append("  • No open ports detected")
+        else:
+            for p in ip_ports:
+                port_num = p.get("port")
+                proto = p.get("protocol") or "tcp"
+                svc = p.get("service") or ""
+                ver = p.get("version") or ""
+
+                # Check httpx result for this IP:port
+                hx = httpx_map.get((ip, port_num), {})
+                status = hx.get("status_code")
+                title = hx.get("title", "")
+
+                port_str = f"{port_num}/{proto}"
+                svc_detail = ": ".join(filter(None, [svc, ver]))
+                if svc_detail:
+                    port_str += f" ({svc_detail})"
+
+                if status or title:
+                    http_info = " → "
+                    parts = []
+                    if status:
+                        parts.append(str(status))
+                    if title:
+                        parts.append(md_text(title, 80))
+                    http_info += " | ".join(parts)
+                    port_str += http_info
+
+                lines.append(f"  • {port_str}")
+
+        shown_hosts += 1
+
+    return "\n".join(lines)
+
+
 def _run_asn_pipeline(
     cfg: Config,
     db_path: Path,
@@ -3275,9 +3549,9 @@ def _run_asn_pipeline(
     job_dir: Path,
 ) -> dict[str, Any]:
     """
-    ASN pipeline: asnmap → mapcidr → naabu port scan.
+    ASN pipeline: asnmap → mapcidr → naabu (alive IPs + open ports) → httpx (status + title).
     Runs in its own thread with its own DB connection so it never blocks the web pipeline.
-    The existing ASN_MAX_IPS cap in mapcidr expansion limits total IPs sent to naabu.
+    Sends a single consolidated notification at the end.
     """
     conn = connect_db(db_path)
     result: dict[str, Any] = {
@@ -3285,6 +3559,7 @@ def _run_asn_pipeline(
         "asn_ips": [],
         "asn_alive_ips": [],
         "port_results": [],
+        "asn_httpx_results": [],
     }
 
     try:
@@ -3292,93 +3567,54 @@ def _run_asn_pipeline(
             logging.info("[%s] ASN Pipeline – disabled via ASN_ENABLED=false", program_name)
             return result
 
-        # ── Step 1: ASN recon (asnmap → mapcidr → alive check) ───────────
-        asn_ranges, asn_ips, asn_alive_ips = run_asn_recon(cfg, roots, job_dir)
+        # ── Step 1: ASN recon (asnmap → mapcidr → naabu) ─────────────────
+        asn_ranges, asn_ips, asn_alive_ips, port_results = run_asn_recon(cfg, roots, job_dir)
         result["asn_ranges"] = asn_ranges
         result["asn_ips"] = asn_ips
         result["asn_alive_ips"] = asn_alive_ips
+        result["port_results"] = port_results
 
         store_asn_ranges(conn, program_id, asn_ranges)
         store_asn_ips(conn, program_id, asn_ips)
         mark_asn_ips_alive(conn, program_id, asn_alive_ips)
+        store_ports(conn, program_id, port_results)
         logging.info(
-            "[%s] ASN Pipeline – recon completed: %d range(s), %d IP(s) expanded, %d alive",
+            "[%s] ASN Pipeline – recon completed: %d range(s), %d IP(s) expanded, %d alive, %d port(s)",
             program_name,
             len(asn_ranges),
             len(asn_ips),
             len(asn_alive_ips),
-        )
-
-        if cfg.notify_step_by_step and asn_ranges:
-            lines = [
-                f"[{program_name}] **ASN recon finished**: "
-                f"{len(asn_ranges)} range(s), {len(asn_alive_ips)} alive IP(s)"
-            ]
-            if asn_alive_ips:
-                lines.append("\n**Alive IPs**")
-                for ip in asn_alive_ips[:15]:
-                    lines.append(f"- {ip}")
-                if len(asn_alive_ips) > 15:
-                    lines.append(f"*...and {len(asn_alive_ips) - 15} more*")
-            send_notify(cfg, "\n".join(lines).strip())
-
-        # ── Step 2: Naabu port scan on alive ASN IPs ─────────────────────
-        if not asn_alive_ips:
-            logging.info("[%s] ASN Pipeline – no alive IPs, skipping naabu", program_name)
-            return result
-
-        port_results = run_naabu(cfg, asn_alive_ips, job_dir)
-        result["port_results"] = port_results
-        logging.info(
-            "[%s] ASN Pipeline – naabu completed: %d port finding(s)",
-            program_name,
             len(port_results),
         )
-        store_ports(conn, program_id, port_results)
 
-        if cfg.notify_step_by_step:
-            unique_ports: dict[tuple, dict] = {}
-            for p in port_results:
-                host = p.get("host")
-                port = p.get("port")
-                if not host or not port:
-                    continue
-                key = (host, port)
-                if key not in unique_ports:
-                    unique_ports[key] = p
-                else:
-                    if not unique_ports[key].get("version") and p.get("version"):
-                        unique_ports[key] = p
+        # ── Step 2: httpx on alive IPs with open ports ───────────────────
+        asn_httpx = []
+        if port_results:
+            asn_httpx = run_asn_httpx(cfg, port_results, job_dir, log_prefix="[ASN Pipeline]")
+            result["asn_httpx_results"] = asn_httpx
+            store_asn_httpx(conn, program_id, asn_httpx)
+            logging.info(
+                "[%s] ASN Pipeline – httpx completed: %d result(s)",
+                program_name,
+                len(asn_httpx),
+            )
+        else:
+            logging.info("[%s] ASN Pipeline – no port results, skipping httpx", program_name)
 
-            host_port_map: dict[str, list[dict]] = {}
-            for p in unique_ports.values():
-                host_port_map.setdefault(p["host"], []).append(p)
-
-            lines = [
-                f"[{program_name}] **ASN Naabu finished**: "
-                f"{len(unique_ports)} unique port findings\n"
-            ]
-            for host, ports in list(host_port_map.items())[:10]:
-                lines.append(f"**{host}**")
-                ports.sort(
-                    key=lambda x: int(x.get("port", 0))
-                    if str(x.get("port", "0")).isdigit()
-                    else 0
-                )
-                for p in ports:
-                    port = p.get("port")
-                    proto = p.get("protocol") or "tcp"
-                    svc = p.get("service") or ""
-                    prod = p.get("version") or ""
-                    details = ": ".join(filter(None, [svc, prod]))
-                    svc_str = f" ({details})" if details else ""
-                    lines.append(f"- {port}/{proto}{svc_str}")
-                lines.append("")
-
-            if len(host_port_map) > 10:
-                lines.append(f"*...and {len(host_port_map) - 10} more hosts*")
-
-            send_notify(cfg, "\n".join(lines).strip())
+        # ── Single consolidated notification ─────────────────────────────
+        if cfg.notify_bin and asn_ranges:
+            report = build_asn_pipeline_report(
+                program_name,
+                asn_ranges,
+                asn_ips,
+                asn_alive_ips,
+                port_results,
+                asn_httpx,
+            )
+            try:
+                send_notify(cfg, report)
+            except Exception as exc:
+                logging.error("ASN pipeline notify failed for %s: %s", program_name, exc)
 
     finally:
         conn.close()
@@ -3539,7 +3775,9 @@ REQUIRED_ENV_KEYS = {
     "NUCLEI_BIN":        "Path to nuclei binary",
     "KATANA_BIN":        "Path to katana binary",
     # Scan options
+    "NUCLEI_ENABLED":    "Enable nuclei scanning (true/false, default: true)",
     "NUCLEI_SEVERITIES": "Nuclei severity filter (e.g. medium,high,critical)",
+    "KATANA_ENABLED":    "Enable katana crawling (true/false, default: true)",
     "KATANA_DEPTH":      "Katana crawl depth (default: 3)",
     "KATANA_HEADLESS":   "Enable katana headless browser mode (true/false)",
     "KATANA_FIELD_SCOPE":"Field scope for katana (-fs) (default: rdn)",
@@ -3551,7 +3789,7 @@ REQUIRED_ENV_KEYS = {
     "NUCLEI_TIMEOUT":    "Nuclei timeout in seconds",
     "KATANA_TIMEOUT":    "Katana crawling timeout in seconds",
     # Maintenance
-    "MAX_JOB_RETENTION_DAYS": "Auto-delete scan artifacts older than N days (0=disable)",
+    "MAX_JOB_RETENTION_DAYS": "Auto-delete scan output older than N days (0=disable)",
     # Debug
     "DRY_RUN":           "Skip running external tools (true/false)",
 }
@@ -3663,12 +3901,14 @@ def load_config() -> Config:
         naabu_bin=env["NAABU_BIN"],
         nuclei_bin=env["NUCLEI_BIN"],
         katana_bin=env["KATANA_BIN"],
+        nuclei_enabled=env.get("NUCLEI_ENABLED", "true").strip().lower() in ("true", "1", "yes"),
         nuclei_severities=env["NUCLEI_SEVERITIES"],
         subfinder_timeout=int(env["SUBFINDER_TIMEOUT"]),
         httpx_timeout=int(env["HTTPX_TIMEOUT"]),
         naabu_timeout=int(env["NAABU_TIMEOUT"]),
         naabu_nmap_cli=env.get("NAABU_NMAP_CLI", "false").strip().lower() in ("true", "1", "yes"),
         nuclei_timeout=int(env["NUCLEI_TIMEOUT"]),
+        katana_enabled=env.get("KATANA_ENABLED", "true").strip().lower() in ("true", "1", "yes"),
         katana_timeout=int(env["KATANA_TIMEOUT"]),
         katana_depth=int(env["KATANA_DEPTH"]),
         katana_headless=env["KATANA_HEADLESS"].strip().lower() in ("true", "1", "yes"),
@@ -3846,7 +4086,7 @@ def main() -> int:
         logging.info("DRY_RUN mode enabled — external tools will not be executed")
 
     try:
-        # Clean up old scan artifacts before starting
+        # Clean up old scan output before starting
         cleanup_old_jobs(cfg.workdir, cfg.max_job_retention_days)
         run_cycle(cfg)
     except KeyboardInterrupt:
